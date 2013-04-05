@@ -667,21 +667,65 @@ bool InjectError_PtrError(Instruction *I)
 
     /*Check if I is of type StoreInst and inject error if true*/
     if(StoreInst *stInst = dyn_cast<StoreInst>(inst))
-    {	
-      Value *tVal=ConstantInt::get(stInst->getPointerOperand()->getType(),mask);
-      Value *top = &(*(stInst->getPointerOperand()));	
-      BinaryOperator *N = BinaryOperator::Create(Instruction::And, tVal, stInst->getPointerOperand(), top->getName(), BI);	     
-      BI->setOperand(0, N);		       
+    { 
+      Value *top = &(*(stInst->getPointerOperand())); 
+      
+      Value* iAddr = new PtrToIntInst(stInst->getPointerOperand(),
+        IntegerType::getInt64Ty(getGlobalContext()),
+        top->getName(),
+        stInst
+        );
+      if(!iAddr) assert(0 ** "Create PtrToInt inst error. This should not happen!");
+
+//    Value *tVal=ConstantInt::get(stInst->getPointerOperand()->getType(),mask);
+      Value *tVal = ConstantInt::get(IntegerType::getInt64Ty(getGlobalContext()), mask);
+      
+//    BinaryOperator *N = BinaryOperator::Create(Instruction::And,
+//        tVal, stInst->getPointerOperand(), top->getName(), BI); 
+      BinaryOperator *N = BinaryOperator::Create(Instruction::And,
+          tVal, iAddr, top->getName(), BI);
+
+      Value* corruptedAddr = new IntToPtrInst(N,
+        stInst->getPointerOperand()->getType(),
+        top->getName(),
+        stInst
+        );
+
+      BI->setOperand(1, corruptedAddr); /* 1? */
       return true;
     }/*end if*/
 
     /*Check if I is of type LoadInst and inject error if true*/
-    if(LoadInst *ldInst = dyn_cast<LoadInst>(inst))
-    {	
-      Value *tVal=ConstantInt::get(ldInst->getPointerOperand()->getType(),mask);
-      Value *top = &(*(ldInst->getPointerOperand()));	
-      BinaryOperator *N = BinaryOperator::Create(Instruction::And, tVal, ldInst->getPointerOperand(), top->getName(), BI);	     
-      BI->setOperand(0, N);		       
+        if(LoadInst *ldInst = dyn_cast<LoadInst>(inst))
+    { 
+      // LLVM says we can't cast an int32* to an integer.
+
+//    IntegerType* iTy = cast<IntegerType>(ldInst->getPointerOperand()->getType());
+      Value *top = &(*(ldInst->getPointerOperand()));
+
+      Value* iAddr = new PtrToIntInst(ldInst->getPointerOperand(),
+        IntegerType::getInt64Ty(getGlobalContext()),
+        top->getName(),
+        ldInst
+        );
+      if(!iAddr) assert(0 && "Create Ptr To Int Inst Error");
+
+//    Value *tVal=ConstantInt::get(ldInst->getPointerOperand()->getType(),mask);
+      Value *tVal = ConstantInt::get(IntegerType::getInt64Ty(getGlobalContext()), mask);
+      
+//    BinaryOperator *N = BinaryOperator::Create(Instruction::And, 
+//        tVal, ldInst->getPointerOperand(), top->getName(), BI);
+      BinaryOperator *N = BinaryOperator::Create(Instruction::And,
+          tVal, iAddr, top->getName(), BI);
+
+      Value* corruptedAddr = new IntToPtrInst(N,
+        ldInst->getPointerOperand()->getType(),
+        top->getName(),
+        ldInst
+        );
+
+      BI->setOperand(0, corruptedAddr);
+
       return true;
     }/*end if*/
 
@@ -698,12 +742,38 @@ bool InjectError_PtrError(Instruction *I)
 
     /*Check if I is of type CallInst and inject error if true*/
     if(CallInst *callInst = dyn_cast<CallInst>(inst))
-    {	
-      Value *tVal=ConstantInt::get(callInst->getCalledValue()->getType(),mask);
-      Value *top = &(*(callInst->getCalledValue()));	
-      BinaryOperator *N = BinaryOperator::Create(Instruction::And, tVal, callInst->getCalledValue(), top->getName(), BI);	     
-      BI->setOperand(0, N);		       
-      return true;
+    { 
+      Type* calledTy = callInst->getCalledValue()->getType();
+      Value *top = &(*(callInst->getCalledValue()));  
+      if(isa<PointerType>(calledTy)) {
+        Value* iAddr = new PtrToIntInst(callInst->getCalledValue(),
+            IntegerType::getInt64Ty(getGlobalContext()),
+            top->getName(),
+            callInst
+          );
+        if(!iAddr) assert(0);
+        Value* tVal = ConstantInt::get(IntegerType::getInt64Ty(getGlobalContext()),
+          mask);
+        BinaryOperator *N = BinaryOperator::Create(Instruction::And, 
+          tVal, iAddr, top->getName(), BI);
+        Value* corruptedCalledValue = new IntToPtrInst(N,
+          calledTy,
+          top->getName(),
+          callInst
+          );
+        callInst->setCalledFunction(corruptedCalledValue);
+        return true;  
+      } else {
+        Value *tVal=ConstantInt::get(callInst->getCalledValue()->getType(),mask);
+        BinaryOperator *N = BinaryOperator::Create(Instruction::And, 
+          tVal, callInst->getCalledValue(), top->getName(), BI);       
+        
+        // Is the code supposed to change the object on which the function is
+        //   called ?
+        // BI->setOperand(0, N);
+        callInst->setCalledFunction(N);
+        return true;
+      }
     }/*end if*/
 
     /*Check if I is of type ReturnInst and inject error if true*/
