@@ -60,6 +60,62 @@ Value* func_print_faultStatistics;
 std::string cstr=""; /*stores fault site name used by fault injection pass*/
 unsigned int lstsize=0; /*Stores instruction list used by static fault injection pass*/
 
+std::set<Value*> corrupted_ptrs;
+
+// Description of this function:
+// It corrupts a pointer (means: inst->getType()->isPointerType() == true)
+// by converting it to a 64-bit integer (b/c assuming a 64-bit machine),
+//    corrupting the integer with existing routines, and converting it back.
+// One caveat is that "replace all uses" of inst should be replaced with
+//    "replace all uses but the first" when updating uses of inst.
+Value* CorruptPointer(Value* inst,
+	BasicBlock::iterator BINext, // 2 cases: may be the end of BB or otherwise.
+	BasicBlock* BB,
+	const std::vector<Value*> _args) {
+	Instruction* INext = &*BINext;
+	char name_ptr2int[40], corr_name_ptr2int[40], corr_name_ptr[40];
+	sprintf(name_ptr2int, "TheFirstGuy");
+	sprintf(corr_name_ptr2int, "TheSecondGuy");
+	sprintf(corr_name_ptr, "TheThirdGuy");
+	CallInst* CallI = NULL;
+	assert(inst->getType()->isPointerTy());
+	Value* iPtr = NULL; // Pointer converted to Integer.
+	if(INext!=NULL) {
+		iPtr = new PtrToIntInst(inst, // Difference between "inst" and the "inst" in an "args" above????
+			IntegerType::getInt64Ty(getGlobalContext()),
+			name_ptr2int,
+			INext
+		);
+	} else {
+		iPtr = new PtrToIntInst(inst,
+			IntegerType::getInt64Ty(getGlobalContext()),
+			name_ptr2int,
+			BB
+		);
+	}
+	if(!iPtr) assert(0);
+	std::vector<Value*> args = _args;
+	args.push_back(iPtr); // <--- The input param is not modified!
+
+	
+	Value* corruptedPtr = NULL;
+	if(INext != NULL) { 
+		CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, INext);
+		corruptedPtr = new IntToPtrInst(CallI,
+			inst->getType(),
+			corr_name_ptr,
+			INext
+		);
+	} else {
+		CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, BB);
+		corruptedPtr = new IntToPtrInst(CallI,
+			inst->getType(),
+			corr_name_ptr,
+			BB
+		);
+	}
+	return corruptedPtr;
+}
 
 std::vector<std::string> splitAtSpace(std::string spltStr){
 	std::vector<std::string> strLst;
@@ -99,47 +155,62 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		/*Choose a fault site in StoreInst and insert Corrupt function call*/
 		if(StoreInst* stOp = dyn_cast<StoreInst>(inst)) 
 		{
-			 User* tstOp = &*stOp;
-			 args.push_back(tstOp->getOperand(0));
-			 CallI = NULL;
-			 /*Integer Data*/
-			 if(tstOp->getOperand(0)->getType()->isIntegerTy(16)){
+			User* tstOp = &*stOp;
+			args.push_back(tstOp->getOperand(0));
+			CallI = NULL;
+			/*Integer Data*/
+			if(tstOp->getOperand(0)->getType()->isIntegerTy(16)){
 					CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",I);
 					assert(CallI);
 					CallI->setCallingConv(CallingConv::C);
-			 }
-			 else if(tstOp->getOperand(0)->getType()->isIntegerTy(32)){
+			} else if(tstOp->getOperand(0)->getType()->isIntegerTy(32)){
 					CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",I);
 					assert(CallI);
 					CallI->setCallingConv(CallingConv::C);
-			 }
-			 else if(tstOp->getOperand(0)->getType()->isIntegerTy(64)){
+			} else if(tstOp->getOperand(0)->getType()->isIntegerTy(64)){
 					CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",I);
 					assert(CallI);
 					CallI->setCallingConv(CallingConv::C);
-			 }
+			}
 
-			 /*Float Data*/
-			 if(tstOp->getOperand(0)->getType()->isFloatTy()){
+			/*Float Data*/
+			if(tstOp->getOperand(0)->getType()->isFloatTy()){
 					CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",I);
 					assert(CallI);
 					CallI->setCallingConv(CallingConv::C);
-			 }
-			 else if(tstOp->getOperand(0)->getType()->isDoubleTy()){
+			} else if(tstOp->getOperand(0)->getType()->isDoubleTy()){
 					CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
 					assert(CallI);
 					CallI->setCallingConv(CallingConv::C);
-			 }
-			 if(CallI) {
-				Value* corruptVal = &(*CallI);
-				 BI->setOperand(0,corruptVal);
-				 return true;
-			} else {
-				errs() << "[DataReg_Dyn Store Inst not captured] ";
-				errs() << *(tstOp->getOperand(0)->getType());
-				errs() << "\n";
-				return false;
 			}
+
+			if(CallI) {
+				Value* corruptVal = &(*CallI);
+				BI->setOperand(0,corruptVal);
+				return true;
+			} else {
+				Value* inst = tstOp->getOperand(0);
+				if(inst->getType()->isPointerTy()) {
+					if(ptr_err == 1) {
+						// When data_err and ptr_err are enabled simultaneously,
+						//    and if the operand 0 is ofo pointer type, it should
+						//    have already been corrupted.
+						assert(corrupted_ptrs.find(inst) !=
+							   corrupted_ptrs.end());
+					} else {
+						args.pop_back();
+						Value* corruptedPtr = CorruptPointer(inst, I, BB, args);
+						tstOp->replaceUsesOfWith(inst, corruptedPtr);
+					}
+					/*
+					errs() << "[DataReg_Dyn Store Inst not captured] ";
+					errs() << *(tstOp);
+					errs() << "\n";
+					*/
+					return false;
+				}
+			}
+			return false;
 		}/*end if*/
 
 		/*Choose a fault site in CmpInst and insert Corrupt function call*/
@@ -178,11 +249,11 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 					CallI->setCallingConv(CallingConv::C);
 			 }
 			 if(CallI) {
-				Value* corruptVal = &(*CallI);
-				BI->setOperand(opPos,corruptVal);
-				return true;
+					Value* corruptVal = &(*CallI);
+					BI->setOperand(opPos,corruptVal);
+					return true;
 				} else {
-					errs() << "[DataReg_Dyn CmpInst not captured] "
+					errs() << "[DataReg_Dyn CmpInst not injected] "
 						<< *(cmpOp->getType()) << "\n";
 					return false;
 				}
@@ -201,42 +272,41 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 			 args.push_back(instC);       
 			 /*Corrupt Variable*/      
 			 if(BI == BB->end()){
-					/* void */
-					if(inst->getType()->isVoidTy())
-						return false;
+				/* void */
+				if(inst->getType()->isVoidTy())
+					return false;
 
-					/*Integer Data*/
-					if(inst->getType()->isIntegerTy(16)){
-						 CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",BB);
-						 assert(CallI);
-						 CallI->setCallingConv(CallingConv::C);
-					}
-					else if(inst->getType()->isIntegerTy(32)){
-						 CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",BB);
-						 assert(CallI);
-						 CallI->setCallingConv(CallingConv::C);
-					}
-					else if(inst->getType()->isIntegerTy(64)){
-						 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",BB);
-						 assert(CallI);
-						 CallI->setCallingConv(CallingConv::C);
-					} else if(inst->getType()->isIntegerTy(8)) {
-						 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_8bit",BB);
-						 assert(CallI);
-						 CallI->setCallingConv(CallingConv::C); 
-					}
+				/*Integer Data*/
+				if(inst->getType()->isIntegerTy(16)){
+					 CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",BB);
+					 assert(CallI);
+					 CallI->setCallingConv(CallingConv::C);
+				}
+				else if(inst->getType()->isIntegerTy(32)){
+					 CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",BB);
+					 assert(CallI);
+					 CallI->setCallingConv(CallingConv::C);
+				}
+				else if(inst->getType()->isIntegerTy(64)){
+					 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",BB);
+					 assert(CallI);
+					 CallI->setCallingConv(CallingConv::C);
+				} else if(inst->getType()->isIntegerTy(8)) {
+					 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_8bit",BB);
+					 assert(CallI);
+					 CallI->setCallingConv(CallingConv::C); 
+				}
 
-					/*Float Data*/
-					if(inst->getType()->isFloatTy()){
+				/*Float Data*/
+				if(inst->getType()->isFloatTy()){
 						 CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",BB);
 						 assert(CallI);
 						 CallI->setCallingConv(CallingConv::C);
+				} else if(inst->getType()->isDoubleTy()){
+					 CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",BB);
+					 assert(CallI);
+					 CallI->setCallingConv(CallingConv::C);
 				}
-					else if(inst->getType()->isDoubleTy()){
-						 CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",BB);
-						 assert(CallI);
-						 CallI->setCallingConv(CallingConv::C);
-					}
 
 			} else {
 				BINext = BI;
@@ -278,48 +348,12 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 				inst->replaceAllUsesWith(corruptVal);
 				return true;
 			} else {
-				// How about casting to a 64 bit, corrupt, and converting back.
-				if(insts_replaced.find(inst) != insts_replaced.end()) return false;
-				if(insts_replaced.size() > 0) return false;
-				int idx = insts_replaced.size() + 1;
-				char name_ptr2int[40], corr_name_ptr2int[40], corr_name_ptr[40];
-				sprintf(name_ptr2int, "TheFirstGuy%d", idx);
-				sprintf(corr_name_ptr2int, "TheSecondGuy%d", idx);
-				sprintf(corr_name_ptr, "TheThirdGuy%d", idx);
 				if(inst->getType()->isPointerTy()) {
-					Value* iPtr = NULL;
-					if(INext != NULL) {
-						iPtr = new PtrToIntInst(inst, // Difference between "inst" and the "inst" in an "args" above????
-							IntegerType::getInt64Ty(getGlobalContext()),
-							name_ptr2int,
-							INext
-						);
-					} else {
-						iPtr = new PtrToIntInst(inst,
-							IntegerType::getInt64Ty(getGlobalContext()),
-							name_ptr2int,
-							BB
-						);
-					}
-					if(!iPtr) assert(0);
 					args.pop_back();
-					args.push_back(iPtr);
-					Value* corruptedPtr = NULL;
-					if(INext != NULL) { 
-						CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, INext);
-						corruptedPtr = new IntToPtrInst(CallI,
-							inst->getType(),
-							corr_name_ptr,
-							INext
-						);
-					} else {
-						CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, BB);
-						corruptedPtr = new IntToPtrInst(CallI,
-							inst->getType(),
-							corr_name_ptr,
-							BB
-						);
-					}
+					// How about casting to a 64 bit, corrupt, and converting back?
+					Value* corruptedPtr = CorruptPointer(inst, INext, BB, args);
+					corrupted_ptrs.insert(corruptedPtr);
+					
 					// -------------------------------------------------------------------
 					// CAUTION! Only uses AFTER the first use can be replaced!!!!
 					// -------------------------------------------------------------------
@@ -338,14 +372,13 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 							BI2++;
 						}
 					}
-					insts_replaced.insert(inst);
-					insts_replaced.insert(corruptedPtr);
 					return true;
+				} else {
+					errs() << "[DataReg_Dyn Other Inst not recognized] " <<
+						*(inst->getType()) << "\n";
+					return false;
 				}
-			errs() << "[DataReg_Dyn Other Inst not recognized] " <<
-				*(inst->getType()) << "\n";
-			return false;
-		}
+			}
 	}/*end if*/
 	return false;
 }/*InjectError_DataReg_Dyn*/
