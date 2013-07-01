@@ -1,3 +1,4 @@
+// Modified by Tommy
 /*******************************************************************************************/
 /* Name        : Kontrollable Utah LLVM Fault Injector (KULFI) Tool                        */
 /*											   										       */
@@ -6,11 +7,12 @@
 /*               Please send your queries to: gauss@cs.utah.edu                            */
 /*               Researh Group Home Page: http://www.cs.utah.edu/formal_verification/      */
 /* Version     : beta 									   								   */
-/* Last Edited : 03/12/2013                                                                */
+/* Last Edited : 06/26/2013                                                                */
 /* Copyright   : Refer to LICENSE document for details 					                   */
 /*******************************************************************************************/
 
 #include <sstream>
+#include <map>
 #include <algorithm>
 #include <iterator>
 #include <string>
@@ -19,6 +21,7 @@
 #include <stdio.h>
 #include <llvm/Pass.h>
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/Argument.h>
 #include <llvm/Function.h>
 #include <llvm/Module.h>
 #include <llvm/User.h>
@@ -57,10 +60,109 @@ Value* func_corruptIntAdr_64bit;
 Value* func_corruptFloatAdr_32bit;
 Value* func_corruptFloatAdr_64bit;
 Value* func_print_faultStatistics;
+Value* func_incrementInstCount;
+Value* func_printInstCount;
+Value* func_initFaultInjectionCampaign;
+Value* func_main;
 std::string cstr=""; /*stores fault site name used by fault injection pass*/
 unsigned int lstsize=0; /*Stores instruction list used by static fault injection pass*/
+int g_fault_index = 0;
 
-std::set<Value*> corrupted_ptrs;
+std::set<Instruction*> corrupted_ptrs;
+std::map<BasicBlock*, unsigned> bb_inst_counts;
+
+// Do not perform fault injection to these functions!
+static const char* blacklist[] = {
+	"shouldInject",
+	"incrementInstCount",
+	"print_faultStatistics",
+	"__printInstCount",
+	"printFaultInfo",
+	"initializeFaultInjectionCampaign",
+	"shouldInject"
+};
+static bool isFunctionNameBlacklisted(const char* fn) {
+	for(unsigned i=0; i<sizeof(blacklist) / sizeof(char*); i++) {
+		if(!strcmp(blacklist[i], fn)) return true;
+	}
+	return false;
+}
+
+static void recordBasicBlockSizes(Module& M) {
+	Module::FunctionListType &fl = M.getFunctionList();
+	for(Module::iterator it = fl.begin(); it!=fl.end(); it++) {
+		Function& F = *it;
+		for(Function::iterator bi = F.begin(); bi!=F.end(); bi++) {
+			BasicBlock* bb = &(*bi);
+			bb_inst_counts[bb] = bb->size();
+		}
+	}
+}
+
+// Add calls to some accounting function for keeping track of # of insts
+// executed
+static const char* blacklist1[] = {
+	"incrementInstCount",
+	"__printInstCount",
+	"corruptIntData_16bit",
+	"corruptIntData_32bit",
+	"corruptIntData_64bit",
+	"corruptIntData_8bit",
+	"corruptFloatData_32bit",
+	"corruptFloatData_64bit",
+	"corruptIntAdr_32bit",
+	"corruptIntAdr_64bit",
+	"corruptFloatAdr_32bit",
+	"corruptFloatAdr_64bit",
+	"print_faultStatistics",
+	"printFaultInfo",
+	"main",
+	"initializeFaultInjectionCampaign",
+	"shouldInject"
+};
+static void appendInstCountCalls(Module& M) {
+	// Call incrementInstCount using the constants as arguments.
+	Module::FunctionListType &fl = M.getFunctionList();
+	for(Module::iterator it = fl.begin(); it!=fl.end(); it++) {
+		Function& F = *it;
+		std::string cstr = it->getName().str();
+		bool is_blacklisted = false;
+		for(unsigned i=0; i<sizeof(blacklist1)/sizeof(char*); i++) {
+			errs() << cstr << ",\n";
+			if(cstr == blacklist1[i]) { 
+				errs() << "Blacklisted.\n";
+				is_blacklisted = true; break; 
+			}
+		}
+		if(is_blacklisted) continue;
+		for(Function::iterator bi = F.begin(); bi!=F.end(); bi++) {
+			BasicBlock* bb = &(*bi);
+			Instruction* last_inst = &(bb->back());
+			unsigned size = 0;
+			if(!(bb_inst_counts.find(bb) != bb_inst_counts.end())) {
+				bb->getParent()->dump();
+				assert(false);
+			}
+			size = bb_inst_counts[bb];
+			errs() << "bb = " << size << "\n";
+			std::vector<Value*> args;
+			args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),
+				size));
+			CallInst* inc_call = CallInst::Create(func_incrementInstCount, args,
+				"", last_inst);
+			assert(inc_call);
+
+		}
+
+		if(cstr == "main") { // Outro
+			BasicBlock* bb = &(it->back());
+			Instruction* last_inst = &(bb->back());
+			CallInst* instcnt_call = CallInst::Create(func_printInstCount, 
+				std::vector<Value*>(), "", last_inst);
+			assert(instcnt_call);
+		}
+	}
+}
 
 // Description of this function:
 // It corrupts a pointer (means: inst->getType()->isPointerType() == true)
@@ -71,7 +173,7 @@ std::set<Value*> corrupted_ptrs;
 Value* CorruptPointer(Value* inst,
 	BasicBlock::iterator BINext, // 2 cases: may be the end of BB or otherwise.
 	BasicBlock* BB,
-	const std::vector<Value*> _args) {
+	std::vector<Value*>& _args) {
 	Instruction* INext = &*BINext;
 	char name_ptr2int[40], corr_name_ptr2int[40], corr_name_ptr[40];
 	sprintf(name_ptr2int, "TheFirstGuy");
@@ -86,18 +188,29 @@ Value* CorruptPointer(Value* inst,
 			name_ptr2int,
 			INext
 		);
+		corrupted_ptrs.insert((Instruction*)(iPtr));
 	} else {
 		iPtr = new PtrToIntInst(inst,
 			IntegerType::getInt64Ty(getGlobalContext()),
 			name_ptr2int,
 			BB
 		);
+		corrupted_ptrs.insert((Instruction*)(iPtr));
 	}
 	if(!iPtr) assert(0);
 	std::vector<Value*> args = _args;
+	g_fault_index++;
+	// Increment g_fault_index
+	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),g_fault_index));
+	std::vector<Value*>::iterator itr;
+	itr = _args.begin();
+	itr++;
+	for(; itr!=_args.end(); itr++) {
+		Value* v = *itr;
+		args.push_back((Value*)v);
+	}
 	args.push_back(iPtr); // <--- The input param is not modified!
 
-	
 	Value* corruptedPtr = NULL;
 	if(INext != NULL) { 
 		CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, INext);
@@ -106,6 +219,8 @@ Value* CorruptPointer(Value* inst,
 			corr_name_ptr,
 			INext
 		);
+		corrupted_ptrs.insert(CallI);
+		corrupted_ptrs.insert((Instruction*)(corruptedPtr));
 	} else {
 		CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, BB);
 		corruptedPtr = new IntToPtrInst(CallI,
@@ -113,6 +228,8 @@ Value* CorruptPointer(Value* inst,
 			corr_name_ptr,
 			BB
 		);
+		corrupted_ptrs.insert(CallI); 
+		corrupted_ptrs.insert((Instruction*)(corruptedPtr));
 	}
 	return corruptedPtr;
 }
@@ -127,261 +244,314 @@ std::vector<std::string> splitAtSpace(std::string spltStr){
 }
 
 /*Injects dynamic fault(s) into data register*/
-std::set<Value*> insts_replaced;
 bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 {
 	if(I == NULL)		
+		return false;
+	/*Locate the instruction I in the basic block BB*/  
+	Value *inst = &(*I);    
+	if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
+	
+	BasicBlock *BB = I->getParent();   
+	BasicBlock::iterator BI, BINext;
+	for(BI=BB->begin(); BI!=BB->end(); BI++) { if(BI == *I) break; }
+
+	/*Build argument list before calling Corrupt function*/
+	CallInst* CallI=NULL;
+	std::vector<Value*> args;
+	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),fault_index));
+	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ijo));
+	if(print_fs)
+		 args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),0));
+	else
+		 args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ef));
+	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),tf));
+	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),byte_val));
+
+	/*Choose a fault site in StoreInst and insert Corrupt function call*/
+	if(StoreInst* stOp = dyn_cast<StoreInst>(inst)) 
+	{
+		User* tstOp = &*stOp;
+		args.push_back(tstOp->getOperand(0));
+		CallI = NULL;
+		/*Integer Data*/
+		if(tstOp->getOperand(0)->getType()->isIntegerTy(16)){
+			CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} else if(tstOp->getOperand(0)->getType()->isIntegerTy(32)){
+			CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} else if(tstOp->getOperand(0)->getType()->isIntegerTy(64)){
+			CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} else if(tstOp->getOperand(0)->getType()->isIntegerTy(8)) {
+			CallI = CallInst::Create(func_corruptIntData_8bit,args,"call_corruptIntData_8bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} /*Float Data*/
+		else if(tstOp->getOperand(0)->getType()->isFloatTy()){
+			CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} else if(tstOp->getOperand(0)->getType()->isDoubleTy()){
+			CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		}
+
+		if(CallI) {
+			Value* corruptVal = &(*CallI);
+			BI->setOperand(0,corruptVal);
+			return true;
+		} else {
 			return false;
-		/*Locate the instruction I in the basic block BB*/  
-		Value *inst = &(*I);    
-		BasicBlock *BB = I->getParent();   
-		BasicBlock::iterator BI,BINext;
-		for(BI=BB->begin();BI!=BB->end();BI++)    
-				if (BI == *I)
-		 break;  
+			Value* inst = tstOp->getOperand(0);
+			if(inst->getType()->isPointerTy()) {
+				if(ptr_err == 1) {
+					// When data_err and ptr_err are enabled simultaneously,
+					//    and if the operand 0 is ofo pointer type, it should
+					//    have already been corrupted.
+					inst->dump();
+					errs() << corrupted_ptrs.size() << " etys\n";
+					if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
+					args.pop_back();
+					Value* corruptedPtr = CorruptPointer(inst, I, BB, args);
+					errs() << "old store: "; tstOp->dump();
+					tstOp->replaceUsesOfWith(inst, corruptedPtr);
+					errs() << "inst: "; inst->dump();
+					errs() << "corrupted: "; corruptedPtr->dump();
+					errs() << "new store: "; tstOp->dump();
+				}
+				/*
+				errs() << "[DataReg_Dyn Store Inst not captured] ";
+				errs() << *(tstOp);
+				errs() << "\n";
+				*/
+				return false;
+			}
+		}
+		tstOp->dump();
+		assert(0);
+	}/*end if*/
 
-		/*Build argument list before calling Corrupt function*/
-		CallInst* CallI=NULL;
-		std::vector<Value*> args;
-		args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),fault_index));
-		args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ijo));
-		if(print_fs)
-			 args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),0));
-		else
-			 args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ef));
-		args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),tf));
-		args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),byte_val));
+	/*Choose a fault site in CmpInst and insert Corrupt function call*/
+	if(CmpInst* cmpOp = dyn_cast<CmpInst>(inst))
+	{
+		unsigned int opPos=rand()%2;
+		User* tcmpOp = &*cmpOp;
+		args.push_back(tcmpOp->getOperand(opPos));
+		CallI = NULL;
+		/*integer data*/
+		if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(16)){          
+			CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		}
+		else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(32)){          
+			CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		}
+		else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(64)){
+			CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		}
+		
+		/*Float Data*/
+		if(tcmpOp->getOperand(opPos)->getType()->isFloatTy()){
+			CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} else if(tcmpOp->getOperand(opPos)->getType()->isDoubleTy()){
+			CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		}
+		
+		if(CallI) {
+			Value* corruptVal = &(*CallI);
+			BI->setOperand(opPos,corruptVal);
+			return true;
+		} else {
+			errs() << "[DataReg_Dyn CmpInst not injected] "
+				<< *(cmpOp->getType()) << "\n";
+			return false;
+		}
+		assert(0);
+	}/*end if*/
 
-		/*Choose a fault site in StoreInst and insert Corrupt function call*/
-		if(StoreInst* stOp = dyn_cast<StoreInst>(inst)) 
-		{
-			User* tstOp = &*stOp;
-			args.push_back(tstOp->getOperand(0));
-			CallI = NULL;
+	/*Choose a fault site in a chosen instruction which neither CmpInst nor StoreInst 
+		and insert Corrupt function call*/
+	if(!isa<CmpInst>(inst) && !isa<StoreInst>(inst)) 
+	{
+		/*
+		Instruction* INext=NULL;
+		Instruction *IClone = I->clone();
+		assert(IClone);
+		IClone->insertAfter(I); // Why clone ?????????????
+		Value *instC = &(*IClone);
+		BI = *IClone;
+		args.push_back(instC);
+		*/
+		BasicBlock::iterator BI2 = BI; BI2++;
+		if(BI2 == BB->end()) {
+			errs() << "Oh!\n";
+			return false;
+		}
+		Instruction* INext = &(*BI2);
+		Value* instC = &(*I);
+		args.push_back(instC);
+		
+		
+		#define CHECK_ARGS(fn) \
+		{ \
+			Function* f = (Function*)(fn); \
+			errs() << "::::" << f->getArgumentList().size() << "," << args.size() ; \
+			inst->getType()->dump(); \
+			errs() << "\n"; \
+			Function::ArgumentListType::iterator itr = f->getArgumentList().begin(); \
+			std::vector<Value*>::iterator itr2 = args.begin(); \
+			for(; itr!=f->getArgumentList().end(); itr++, itr2++) { \
+				Value* v = *itr2; \
+				Argument* a = &(*itr); \
+				Type* t_v = v->getType(); \
+				Type* t_a = a->getType(); \
+				errs() << " :: "; \
+				t_v->dump();  \
+				errs() << " ";  \
+				t_a->dump();  \
+				errs() << " \n"; \
+			} \
+		}
+		
+		/*Corrupt Variable*/      
+		if(BI == BB->end()){
+			/* void */
+			if(inst->getType()->isVoidTy())
+				return false;
+
 			/*Integer Data*/
-			if(tstOp->getOperand(0)->getType()->isIntegerTy(16)){
-					CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			} else if(tstOp->getOperand(0)->getType()->isIntegerTy(32)){
-					CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			} else if(tstOp->getOperand(0)->getType()->isIntegerTy(64)){
-					CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
+			if(inst->getType()->isIntegerTy(16)){
+				CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",BB);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isIntegerTy(32)){
+				
+				
+				CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",BB);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isIntegerTy(64)){
+				CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",BB);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isIntegerTy(8)) {
+				CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_8bit",BB);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C); 
 			}
 
 			/*Float Data*/
-			if(tstOp->getOperand(0)->getType()->isFloatTy()){
-					CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			} else if(tstOp->getOperand(0)->getType()->isDoubleTy()){
-					CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
+			if(inst->getType()->isFloatTy()){
+				CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",BB);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isDoubleTy()){
+				CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",BB);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
 			}
 
-			if(CallI) {
-				Value* corruptVal = &(*CallI);
-				BI->setOperand(0,corruptVal);
-				return true;
-			} else {
-				Value* inst = tstOp->getOperand(0);
-				if(inst->getType()->isPointerTy()) {
-					if(ptr_err == 1) {
-						// When data_err and ptr_err are enabled simultaneously,
-						//    and if the operand 0 is ofo pointer type, it should
-						//    have already been corrupted.
-						assert(corrupted_ptrs.find(inst) !=
-							   corrupted_ptrs.end());
-					} else {
-						args.pop_back();
-						Value* corruptedPtr = CorruptPointer(inst, I, BB, args);
-						tstOp->replaceUsesOfWith(inst, corruptedPtr);
-					}
-					/*
-					errs() << "[DataReg_Dyn Store Inst not captured] ";
-					errs() << *(tstOp);
-					errs() << "\n";
-					*/
-					return false;
-				}
+		} else {
+			BINext = BI;
+			BINext++;
+			INext = &*BINext;
+			assert(INext);
+			/*Integer Data*/
+			
+			if(inst->getType()->isVoidTy()) return false;
+
+			if(inst->getType()->isIntegerTy(16)){
+				CallI = CallInst::Create(func_corruptIntData_16bit, args, "call_corruptIntData_16bit", INext);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isIntegerTy(32)){
+				CallI = CallInst::Create(func_corruptIntData_32bit, args, "call_corruptIntData_32bit", INext);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isIntegerTy(64)){
+				CallI = CallInst::Create(func_corruptIntData_64bit, args, "call_corruptIntData_64bit", INext);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isIntegerTy(8)){
+				CallI = CallInst::Create(func_corruptIntData_8bit, args, "call_corruptIntData_8bit", INext);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} /*Float Data*/
+			else if(inst->getType()->isFloatTy()){
+				CallI = CallInst::Create(func_corruptFloatData_32bit, args, "call_corruptFloatData_32bit", INext);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			} else if(inst->getType()->isDoubleTy()){
+				CallI = CallInst::Create(func_corruptFloatData_64bit, args, "call_corruptFloatData_64bit", INext);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
 			}
+		}
+		if(CallI){
+			Value* corruptVal = &(*CallI);
+			// Tommy: Shall not replace the original instruction itself.
+//				inst->replaceAllUsesWith(corruptVal);
+			BasicBlock::iterator BI2 = BI;
+			BI2++; // The inserted instruction, don't substitute
+			BI2++; // The one after the inserted instruction, substitute
+			while(BI2 != BB->end()) {
+				Instruction* valu = &(*BI2);
+				valu->replaceUsesOfWith(inst, corruptVal);
+				BI2++;
+			}
+			return true;
+		} else {
 			return false;
-		}/*end if*/
+			if(inst->getType()->isPointerTy() && ptr_err==1) {
+				if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
 
-		/*Choose a fault site in CmpInst and insert Corrupt function call*/
-		if(CmpInst* cmpOp = dyn_cast<CmpInst>(inst))
-		{
-			 unsigned int opPos=rand()%2;
-			 User* tcmpOp = &*cmpOp;
-			 args.push_back(tcmpOp->getOperand(opPos));
-			 CallI = NULL;
-			 /*integer data*/
-			 if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(16)){          
-					CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			 }
-			 else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(32)){          
-					CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			 }
-			 else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(64)){
-					CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			 }
-
-			 /*Float Data*/
-			 if(tcmpOp->getOperand(opPos)->getType()->isFloatTy()){
-					CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			 }
-			 else if(tcmpOp->getOperand(opPos)->getType()->isDoubleTy()){
-					CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-			 }
-			 if(CallI) {
-					Value* corruptVal = &(*CallI);
-					BI->setOperand(opPos,corruptVal);
-					return true;
-				} else {
-					errs() << "[DataReg_Dyn CmpInst not injected] "
-						<< *(cmpOp->getType()) << "\n";
-					return false;
+				args.pop_back();
+				// How about casting to a 64 bit, corrupt, and converting back?
+				Value* corruptedPtr = CorruptPointer(inst, INext, BB, args);
+				
+				// -------------------------------------------------------------------
+				// CAUTION! Only uses AFTER the first use can be replaced!!!!
+				// -------------------------------------------------------------------
+				//  (Converted code)
+				//  %m1 = blah blah blah        Using replaceAllUsesWith will also overwrite
+				//  %First = %m1 to INT   <---- this m1. This is not desired and results in a
+				//  %Second = corrupt %First          broken module
+				//  %Third = %Second to %m1's type
+				//
+				//inst->replaceAllUsesWith(corruptedPtr);
+				{
+					BasicBlock::iterator BI2 = BINext;
+					while(BI2 != BB->end()) {
+						Instruction* valu = &(*BI2);
+						valu->replaceUsesOfWith(inst, corruptedPtr);
+						BI2++;
+					}
 				}
-		}/*end if*/
-
-		/*Choose a fault site in a chosen instruction which neither CmpInst nor StoreInst 
-			and insert Corrupt function call*/
-		if(!isa<CmpInst>(inst) && !isa<StoreInst>(inst)) 
-		{
-			 Instruction* INext=NULL;
-			 Instruction *IClone = I->clone();
-			 assert(IClone);
-			 IClone->insertAfter(I);
-			 Value *instC = &(*IClone);          
-			 BI = *IClone;
-			 args.push_back(instC);       
-			 /*Corrupt Variable*/      
-			 if(BI == BB->end()){
-				/* void */
-				if(inst->getType()->isVoidTy())
-					return false;
-
-				/*Integer Data*/
-				if(inst->getType()->isIntegerTy(16)){
-					 CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",BB);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				}
-				else if(inst->getType()->isIntegerTy(32)){
-					 CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",BB);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				}
-				else if(inst->getType()->isIntegerTy(64)){
-					 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",BB);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				} else if(inst->getType()->isIntegerTy(8)) {
-					 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_8bit",BB);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C); 
-				}
-
-				/*Float Data*/
-				if(inst->getType()->isFloatTy()){
-						 CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",BB);
-						 assert(CallI);
-						 CallI->setCallingConv(CallingConv::C);
-				} else if(inst->getType()->isDoubleTy()){
-					 CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",BB);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				}
-
-			} else {
-				BINext = BI;
-				BINext++;
-				INext = &*BINext;
-				assert(INext);
-				/*Integer Data*/
-				if(inst->getType()->isVoidTy()) return false;
-
-				if(inst->getType()->isIntegerTy(16)){
-					 CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",INext);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				} else if(inst->getType()->isIntegerTy(32)){
-					 CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",INext);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				} else if(inst->getType()->isIntegerTy(64)){
-					 CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",INext);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				} else if(inst->getType()->isIntegerTy(8)){
-					 CallI = CallInst::Create(func_corruptIntData_8bit,args,"call_corruptIntData_8bit",INext);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				} /*Float Data*/
-				if(inst->getType()->isFloatTy()){
-						CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",INext);
-					 assert(CallI);
-					 CallI->setCallingConv(CallingConv::C);
-				} else if(inst->getType()->isDoubleTy()){
-					CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",INext);
-					assert(CallI);
-					CallI->setCallingConv(CallingConv::C);
-				}
-			}
-			if(CallI){
-				Value* corruptVal = &(*CallI);     
-				inst->replaceAllUsesWith(corruptVal);
 				return true;
 			} else {
-				if(inst->getType()->isPointerTy()) {
-					args.pop_back();
-					// How about casting to a 64 bit, corrupt, and converting back?
-					Value* corruptedPtr = CorruptPointer(inst, INext, BB, args);
-					corrupted_ptrs.insert(corruptedPtr);
-					
-					// -------------------------------------------------------------------
-					// CAUTION! Only uses AFTER the first use can be replaced!!!!
-					// -------------------------------------------------------------------
-					//  (Converted code)
-					//  %m1 = blah blah blah        Using replaceAllUsesWith will also overwrite
-					//  %First = %m1 to INT   <---- this m1. This is not desired and results in a
-					//  %Second = corrupt %First          broken module
-					//  %Third = %Second to %m1's type
-					//
-					//inst->replaceAllUsesWith(corruptedPtr);
-					{
-						BasicBlock::iterator BI2 = BINext;
-						while(BI2 != BB->end()) {
-							Instruction* valu = &(*BI2);
-							valu->replaceUsesOfWith(inst, corruptedPtr);
-							BI2++;
-						}
-					}
-					return true;
-				} else {
-					errs() << "[DataReg_Dyn Other Inst not recognized] " <<
-						*(inst->getType()) << "\n";
-					return false;
-				}
+				errs() << "[DataReg_Dyn Other Inst not recognized] " <<
+					*(inst->getType()) << "\n";
+				return false;
 			}
+		}
 	}/*end if*/
 	return false;
-}/*InjectError_DataReg_Dyn*/
+} /* InjectError_DataReg_Dyn */
 
 
 /*Injects dynamic fault(s) into pointer register*/
@@ -400,7 +570,8 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),byte_val));
 
 	/*Locate the instruction I in the basic block BB*/  
-	Value *inst = &(*I);  
+	Value *inst = &(*I);
+	if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
 	BasicBlock *BB = I->getParent();   
 	BasicBlock::iterator BI;
 	for(BI=BB->begin();BI!=BB->end();BI++) {
@@ -519,8 +690,6 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 	}/*end if*/   
 	return false;
 }/*end InjectError_PtrError*/
-
-
 /******************************************************************************************************************************/
 
 /*Dynamic Fault Injection LLVM Pass*/
@@ -528,8 +697,9 @@ namespace {
 class dynfault : public ModulePass {
 public:
 	static char ID; 
-	dynfault() : ModulePass(ID) {}           
-	virtual bool runOnModule(Module &M) {	
+	dynfault() : ModulePass(ID) {}
+	virtual bool runOnModule(Module &M) {
+		errs() << "Haha\n";
 		srand(time(NULL));
 		if(byte_val < 0 || byte_val > 7) 
 		byte_val = rand()%8;				 
@@ -552,132 +722,164 @@ public:
 			lstr = it->getName();
 			cstr = lstr.str();                                        
 			if(cstr.find("print_faultStatistics")!=std::string::npos){
-					func_print_faultStatistics =&*it;       
-					continue;                                                            
+				func_print_faultStatistics =&*it; continue;
 			} if(cstr.find("corruptIntData_16bit")!=std::string::npos) {
-					func_corruptIntData_16bit =&*it;       
-					continue;                                                            
+				func_corruptIntData_16bit =&*it; continue;
 			} if(cstr.find("corruptIntData_32bit")!=std::string::npos) {
-					func_corruptIntData_32bit =&*it;                               
-					continue;                                                            
+				func_corruptIntData_32bit =&*it; continue;
 			} if(cstr.find("corruptIntData_64bit")!=std::string::npos) {
-					func_corruptIntData_64bit =&*it;       
-					continue;                                                            
+				func_corruptIntData_64bit =&*it; continue;
 			} if(cstr.find("corruptIntData_8bit")!=std::string::npos) {
-					func_corruptIntData_8bit =&*it;       
-					continue;                                                            
+				func_corruptIntData_8bit =&*it; continue;
 			} if(cstr.find("corruptFloatData_32bit")!=std::string::npos) {
-					func_corruptFloatData_32bit =&*it;       
-					continue;                                                            
+				func_corruptFloatData_32bit =&*it; continue;
 			} if(cstr.find("corruptFloatData_64bit")!=std::string::npos) {
-					func_corruptFloatData_64bit =&*it;       
-					continue;                                                            
+				func_corruptFloatData_64bit =&*it; continue;
 			} if(cstr.find("corruptIntAdr_32bit")!=std::string::npos) {
-					func_corruptIntAdr_32bit =&*it;       
-					continue;                                                            
+				func_corruptIntAdr_32bit =&*it; continue;
 			} if(cstr.find("corruptIntAdr_64bit")!=std::string::npos) {
-					func_corruptIntAdr_64bit =&*it;       
-					continue;                                                            
+				func_corruptIntAdr_64bit =&*it; continue;
 			} if(cstr.find("corruptFloatAdr_32bit")!=std::string::npos) {
-					func_corruptFloatAdr_32bit =&*it;       
-					continue;                                                            
+				func_corruptFloatAdr_32bit =&*it; continue;
 			} if(cstr.find("corruptFloatAdr_64bit")!=std::string::npos) {
-					func_corruptFloatAdr_64bit =&*it;       
-					continue;                                                            
-			} if(!cstr.compare("main")) {
-				if(print_fs){                    
-				assert(func_print_faultStatistics);
-				Function *Fmain = it;	
-				inst_iterator Imain,INmain,Emain;
-				Imain=inst_begin(Fmain);
-				INmain=Imain;
-				INmain++;
-				for(Emain=inst_end(Fmain);INmain!=Emain;Imain++,INmain++);
-				Value *inst = &(*Imain);
-				std::vector<Value*> args;
-				args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ijo));
-				args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ef));
-				args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),tf));
-				args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),byte_val));
-				if(isa<ReturnInst>(inst)) {
-					Instruction* Im = &(*Imain);
-					CallInst* CallI = CallInst::Create(func_print_faultStatistics,args,"call_print_faultStatistics",Im);
-					CallI->setCallingConv(CallingConv::C);
-				} else {
-					 Instruction* Im = &(*Imain);
-					 BasicBlock *BBm = Im->getParent();
-					 CallInst* CallI = CallInst::Create(func_print_faultStatistics,args,"call_print_faultStatistics",BBm);
-					 CallI->setCallingConv(CallingConv::C);
+				func_corruptFloatAdr_64bit =&*it; continue;
+			} if(cstr.find("incrementInstCount")!=std::string::npos) {
+				func_incrementInstCount =&*it; continue;                            
+			} if(cstr.find("__printInstCount")!=std::string::npos) {
+				func_printInstCount = &*it; continue;
+			} if(cstr.find("initializeFaultInjectionCampaign")!=std::string::npos) {
+				func_initFaultInjectionCampaign = &*it; continue;
+			} if(cstr == "main") {
+				func_main = &*it; continue;
+			} if(!isFunctionNameBlacklisted(cstr.c_str())) {
+				if(print_fs) {
+					assert(func_print_faultStatistics);
+					Function *Fmain = it;	
+					inst_iterator Imain,INmain,Emain;
+					Imain=inst_begin(Fmain);
+					INmain=Imain;
+					INmain++;
+					for(Emain=inst_end(Fmain);INmain!=Emain;Imain++,INmain++);
+					Value *inst = &(*Imain);
+					std::vector<Value*> args;
+					args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ijo));
+					args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ef));
+					args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),tf));
+					args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),byte_val));
+					if(isa<ReturnInst>(inst)) {
+						Instruction* Im = &(*Imain);
+						CallInst* CallI = CallInst::Create(func_print_faultStatistics,args,"call_print_faultStatistics",Im);
+						CallI->setCallingConv(CallingConv::C);
+					} else {
+						 Instruction* Im = &(*Imain);
+						 BasicBlock *BBm = Im->getParent();
+						 CallInst* CallI = CallInst::Create(func_print_faultStatistics,args,"call_print_faultStatistics",BBm);
+						 CallI->setCallingConv(CallingConv::C);
+					}
 				}
-			}
-			continue;                           
-		}          
-	}/*end for*/        
+				continue;                           
+			}          
+		}/*end for*/        
 						
-	/*Cache instructions from all the targetable functions for fault injection in case func list is not
-	 * defined by the use. If func list if defined by the use then cache only function defined by the user*/         
-	for (Module::iterator it = functionList.begin(); it != functionList.end(); ++it,j++){ 
-		lstr = it->getName();
-		cstr = lstr.str();   	 	            
-		if(cstr.find("print_faultStatistics")!=std::string::npos  ||
-		    cstr.find("corruptIntData_8bit")!=std::string::npos   ||
-			cstr.find("corruptIntData_16bit")!=std::string::npos   ||
-			cstr.find("corruptIntData_32bit")!=std::string::npos   ||
-			cstr.find("corruptIntData_64bit")!=std::string::npos   ||
-			cstr.find("corruptFloatData_32bit")!=std::string::npos ||
-			cstr.find("corruptFloatData_64bit")!=std::string::npos ||
-			cstr.find("corruptIntAdr_32bit")!=std::string::npos    ||
-			cstr.find("corruptIntAdr_64bit")!=std::string::npos    ||
-			cstr.find("corruptFloatAdr_32bit")!=std::string::npos  ||
-			cstr.find("corruptFloatAdr_64bit")!=std::string::npos  ||
-			!cstr.compare("main"))                        
-			continue;
-		Function *F=NULL;
-		/*if the user defined function list is empty or the currently selected function is in the list of
-		 * user defined function list then consider the function for fault injection*/
-		if(!func_list.compare("") || std::find(flist.begin(), flist.end(), cstr)!=flist.end())
-			F = it;	
-		else
-			continue;
-		if(F->begin()==F->end())
-			continue;
-
-		/*Cache instruction references with in a function to be considered for fault injection*/             
-		std::set<Instruction*> ilist;
-		for(inst_iterator I=inst_begin(F),E=inst_end(F);I!=E;I++) {
-			Value *in = &(*I);  
-			if(in == NULL)
+		/* Cache instructions from all the targetable functions for fault injection in case func list is not
+		 * defined by the use. If func list if defined by the use then cache only function defined by the user*/         
+		for (Module::iterator it = functionList.begin(); it != functionList.end(); ++it,j++){ 
+			lstr = it->getName();
+			cstr = lstr.str();   	 	            
+			if(cstr.find("print_faultStatistics")!=std::string::npos  ||
+				cstr.find("corruptIntData_8bit")!=std::string::npos   ||
+				cstr.find("corruptIntData_16bit")!=std::string::npos   ||
+				cstr.find("corruptIntData_32bit")!=std::string::npos   ||
+				cstr.find("corruptIntData_64bit")!=std::string::npos   ||
+				cstr.find("corruptFloatData_32bit")!=std::string::npos ||
+				cstr.find("corruptFloatData_64bit")!=std::string::npos ||
+				cstr.find("corruptIntAdr_32bit")!=std::string::npos    ||
+				cstr.find("corruptIntAdr_64bit")!=std::string::npos    ||
+				cstr.find("corruptFloatAdr_32bit")!=std::string::npos  ||
+				cstr.find("corruptFloatAdr_64bit")!=std::string::npos  ||
+				isFunctionNameBlacklisted(cstr.c_str()) )
 				continue;
-			if(data_err)                           
-				if(isa<BinaryOperator>(in) || 
-				   isa<CmpInst>(in)        ||
-				   isa<StoreInst>(in)      ||
-				   isa<LoadInst>(in)) {
-					ilist.insert(&*I);                              
-				}
-			if(ptr_err)
-			if(isa<StoreInst>(in) || 
-			   isa<LoadInst>(in)  ||
-			   isa<CallInst>(in)  ||
-			   isa<AllocaInst>(in)) { 
-				ilist.insert(&*I);
-			}
-		}
-		/*Check if instruction list is empty*/
-		if(ilist.empty())
-			continue;
+			Function *F=NULL;
+			/*if the user defined function list is empty or the currently selected function is in the list of
+			 * user defined function list then consider the function for fault injection*/
+			if(!func_list.compare("") || std::find(flist.begin(), flist.end(), cstr)!=flist.end())
+				F = it;	
+			else
+				continue;
+			if(F->begin()==F->end())
+				continue;
 
-		lstsize = ilist.size();
-		unsigned int i=0;                     
-		for(std::set<Instruction*>::iterator its =ilist.begin();its!=ilist.end();its++,i++) {                          
-			Instruction* inst = *its;
-			if(data_err) InjectError_DataReg_Dyn(inst,i);                        
-			if(ptr_err) {
-				InjectError_PtrError_Dyn(inst,i);
+			/*Cache instruction references with in a function to be considered for fault injection*/             
+			std::set<Instruction*> ilist;
+			for(Function::iterator fi = F->begin(); fi!=F->end(); fi++) {
+				BasicBlock& BB = *fi;
+				unsigned vuln = 0;
+				for(BasicBlock::iterator bi = BB.begin(); bi!=BB.end(); bi++) {
+					unsigned vuln_delta = 0;
+					Instruction* I = &(*bi);
+					Value *in = &(*I);  
+					Instruction* p_in = &*I;
+					if(in == NULL)
+						continue;
+					if(data_err) {                           
+						if(isa<BinaryOperator>(in) || 
+							isa<CmpInst>(in)        ||
+							isa<StoreInst>(in)      ||
+							isa<LoadInst>(in))
+						{
+							ilist.insert(p_in);
+							vuln_delta = 1;
+						}
+					}
+					if(ptr_err) {
+						if(isa<StoreInst>(in) || 
+						isa<LoadInst>(in)  ||
+						isa<CallInst>(in)  ||
+						isa<AllocaInst>(in)) 
+						{
+							ilist.insert(p_in);
+							vuln_delta = 1;
+						}
+					}
+					vuln += vuln_delta;
+				}
+				bb_inst_counts[&BB] = vuln;
 			}
+			/*Check if instruction list is empty*/
+			if(ilist.empty())
+				continue;
+
+			lstsize = ilist.size();
+			while(!ilist.empty()) {
+				Instruction* inst = *(ilist.begin());
+				ilist.erase(inst);         
+				if(ptr_err) {
+					g_fault_index++;
+					InjectError_PtrError_Dyn(inst, g_fault_index);
+				}
+				if(data_err) {
+					g_fault_index++;
+					InjectError_DataReg_Dyn(inst, g_fault_index);
+				}               
+			}/*end for*/
 		}/*end for*/
-	}/*end for*/
-	return false;
+		appendInstCountCalls(M);
+		
+		// Insert call to initialize fault injection campaign
+		{
+			assert(func_main);
+			BasicBlock* b = ((Function*)(func_main))->begin();
+			Instruction* first = b->begin();
+			
+			std::vector<Value*> args;
+			args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), ef));
+			args.push_back(ConstantInt::get( IntegerType::getInt32Ty(getGlobalContext()), tf));
+
+			CallInst* call_init = CallInst::Create(func_initFaultInjectionCampaign,
+				args, "", first);
+			assert(call_init);
+		}
+		return false;
 	}/*end function definition*/
 };/*end class definition*/
 }/*end namespace*/
@@ -685,7 +887,6 @@ public:
 char dynfault::ID = 0;
 static RegisterPass<dynfault> F0("dynfault", "Dynamic Fault Injection emulating transient hardware error behavior");
 /******************************************************************************************************************************/
-
 
 /*Prints static fault injection statistics*/
 void printStat(unsigned int indexloc, bool inst_flag, bool func_flag) {
@@ -715,7 +916,7 @@ bool InjectError_DataReg(Instruction *I) {
 	/*generate random probablity and check it against user defined probablity*/
 	int p=(rand()%tf)+1;
 	if(p>ef)        
-			return false;
+		return false;
 	
 	/*Locate the instruction I in the basic block BB*/
 	BasicBlock *BB = I->getParent();   
@@ -899,7 +1100,8 @@ namespace {
 		public:
 			static char ID; 
 			staticfault() : ModulePass(ID) {}	                
-			virtual bool runOnModule(Module &M) {	
+			virtual bool runOnModule(Module &M) {
+				assert(0); // Disabled for the moment. June 26
 				srand(time(NULL));
 				if(byte_val < 0 || byte_val > 7) 
 					byte_val = rand()%8;
