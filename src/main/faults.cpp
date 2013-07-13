@@ -12,12 +12,15 @@
 /*******************************************************************************************/
 
 #include <sstream>
+#include <fstream>
 #include <map>
+#include <vector>
 #include <algorithm>
 #include <iterator>
 #include <string>
 #include <assert.h>
 #include <iostream>
+#include <fstream>
 #include <stdio.h>
 #include <llvm/Pass.h>
 #include <llvm/ADT/ArrayRef.h>
@@ -38,6 +41,9 @@
 #include "llvm/Analysis/Verifier.h"
 #include "llvm/Assembly/PrintModulePass.h"
 
+// Log the information of fault sites
+//   in case they become useful afterwards
+
 using namespace llvm;
 
 static cl::opt<std::string> func_list("fn", cl::desc("Name(s) of the function(s) to be targeted"), cl::value_desc("func1 func2 func3"), cl::init(""), cl::ValueRequired);
@@ -48,6 +54,40 @@ static cl::opt<bool> data_err("de", cl::desc("Inject Data Register Error"), cl::
 static cl::opt<int> ijo("ijo", cl::desc("Inject Error Only Once"), cl::value_desc("0/1"), cl::init(1), cl::ValueRequired);
 static cl::opt<int> print_fs("pfs", cl::desc("Print Fault Statistics"), cl::value_desc("0/1"), cl::init(0));
 static cl::opt<bool> ptr_err("pe", cl::desc("Inject Pointer Register Error"), cl::value_desc("0/1"), cl::init(0), cl::ValueRequired);
+
+// Injection "whitelist"
+static std::list<std::string> inj_funcname_whitelist;
+static bool shouldInjectFunction(const Function* f) {
+	// If no whitelist entry ---> always "true"
+	if(inj_funcname_whitelist.empty()) return true;
+	else {
+		std::string fn_name = f->getName().str();
+		for(std::list<std::string>::iterator itr = inj_funcname_whitelist.begin();
+			itr != inj_funcname_whitelist.end(); itr++) {
+			if(!(fn_name.compare(*itr))) return true;
+		}
+	}
+	return false;
+}
+
+static void readFunctionInjWhitelist() {
+	std::ifstream in("./funclist.txt");
+	if(!(in.good())) {
+		fprintf(stderr, "[dynfault] Function injection whitelist not enabled.\n");
+		fprintf(stderr, "           Defaulting to injecting into all possible fault sites.\n");
+		return;
+	} else {
+		std::string line;
+		while(in.good()) {
+			in >> line;
+			fprintf(stderr, "[dynfault] %s\n", line.c_str());
+			inj_funcname_whitelist.push_back(line);
+		}
+		in.close();
+	}
+	fprintf(stderr, "[dynfault] %lu entries in whitelist.\n",
+		inj_funcname_whitelist.size());
+}
 
 Value* func_corruptIntData_8bit;
 Value* func_corruptIntData_16bit;
@@ -66,10 +106,66 @@ Value* func_initFaultInjectionCampaign;
 Value* func_main;
 std::string cstr=""; /*stores fault site name used by fault injection pass*/
 unsigned int lstsize=0; /*Stores instruction list used by static fault injection pass*/
+
 int g_fault_index = 0;
+enum FaultType {
+	DYN_FAULT_DATA,
+	DYN_FAULT_PTR
+};
+// Instruction may change ?
+static std::map<int, std::pair<std::string, FaultType> > g_fault_sites;
 
 std::set<Instruction*> corrupted_ptrs;
 std::map<BasicBlock*, unsigned> bb_inst_counts;
+
+static std::string instToString(const Instruction* inst) {
+	std::string str;
+	raw_string_ostream os(str);
+	inst->print(os, NULL);
+	return str;
+}
+
+// Use-def graph
+// The same pointer would always point to the [source] (uninjected) instruction
+//   this would help us locate the instruction in the use-def chain
+#ifdef TOMMY_TEST
+std::map<const Value*, std::string> test0;
+#endif
+unsigned long num_nodes;
+std::set<unsigned long> is_in_chain; // Is a node in the use-def chain?
+std::set<unsigned long> is_terminator; // Is this a terminator instruction?
+std::set<int> injected_fault_indices; // Is the fault site at this index really injected?
+std::map<const BasicBlock*, std::list<unsigned long> > nodeids_in_basicblocks;
+std::map<const BasicBlock*, std::string> bb_names;
+std::map<const Function*, std::list<const BasicBlock*> > bbs_in_funcs;
+std::map<const Value*, unsigned long> fault_site_to_nodeid;
+std::map<unsigned long, int> nodeid_to_fault_site_id;
+std::map<unsigned long, const char*> node_type_names;
+std::list<std::pair<unsigned long, unsigned long> > usedef_edge_list;
+std::list<std::pair<unsigned long, unsigned long> > branch_edge_list;
+void writeFaultSiteDOTGraph();
+
+// Don't use this routine. It's painfully slow!
+static void logFaultSiteInfo(const Instruction* inst, int fault_index, FaultType fault_type) {
+	assert((g_fault_sites.find(fault_index) == g_fault_sites.end()) &&
+		"Each fault site shall have a unique number.");
+#ifdef TOMMY_TEST
+	std::string inst_str = instToString(inst);
+	if(!(test0[inst] == inst_str)) {
+		errs() << test0[inst] << "   vs   " << inst_str << "\n";
+	}
+#else
+	std::string inst_str = "blah";
+#endif
+	// Instruction to Instruction I.D.
+	const Value* site = dynamic_cast<const Value*>(inst);
+	assert(site);
+	if(site) {
+		unsigned long node_id = fault_site_to_nodeid.at(site);
+		nodeid_to_fault_site_id[node_id] = fault_index;
+	}
+	g_fault_sites[fault_index] = std::make_pair(inst_str, fault_type);
+}
 
 // Do not perform fault injection to these functions!
 static const char* blacklist[] = {
@@ -81,23 +177,6 @@ static const char* blacklist[] = {
 	"initializeFaultInjectionCampaign",
 	"shouldInject"
 };
-static bool isFunctionNameBlacklisted(const char* fn) {
-	for(unsigned i=0; i<sizeof(blacklist) / sizeof(char*); i++) {
-		if(!strcmp(blacklist[i], fn)) return true;
-	}
-	return false;
-}
-
-static void recordBasicBlockSizes(Module& M) {
-	Module::FunctionListType &fl = M.getFunctionList();
-	for(Module::iterator it = fl.begin(); it!=fl.end(); it++) {
-		Function& F = *it;
-		for(Function::iterator bi = F.begin(); bi!=F.end(); bi++) {
-			BasicBlock* bb = &(*bi);
-			bb_inst_counts[bb] = bb->size();
-		}
-	}
-}
 
 // Add calls to some accounting function for keeping track of # of insts
 // executed
@@ -108,6 +187,7 @@ static const char* blacklist1[] = {
 	"corruptIntData_32bit",
 	"corruptIntData_64bit",
 	"corruptIntData_8bit",
+	"corruptIntData_1bit",
 	"corruptFloatData_32bit",
 	"corruptFloatData_64bit",
 	"corruptIntAdr_32bit",
@@ -118,8 +198,21 @@ static const char* blacklist1[] = {
 	"printFaultInfo",
 	"main",
 	"initializeFaultInjectionCampaign",
-	"shouldInject"
+	"shouldInject",
+	"onCountDownReachesZero"
 };
+
+static bool isFunctionNameBlacklisted(const char* fn) {
+	for(unsigned i=0; i<sizeof(blacklist) / sizeof(const char*); i++) {
+		if(!strcmp(blacklist[i], fn)) return true;
+	}
+	for(unsigned i=0; i<sizeof(blacklist1)/ sizeof(const char*); i++) {
+		if(!strcmp(blacklist1[i], fn)) return true;
+	}
+	return false;
+}
+
+// Counts how many fault sites there are in this module
 static void appendInstCountCalls(Module& M) {
 	// Call incrementInstCount using the constants as arguments.
 	Module::FunctionListType &fl = M.getFunctionList();
@@ -128,9 +221,9 @@ static void appendInstCountCalls(Module& M) {
 		std::string cstr = it->getName().str();
 		bool is_blacklisted = false;
 		for(unsigned i=0; i<sizeof(blacklist1)/sizeof(char*); i++) {
-			errs() << cstr << ",\n";
+//			errs() << cstr << ",\n";
 			if(cstr == blacklist1[i]) { 
-				errs() << "Blacklisted.\n";
+	//			errs() << "Blacklisted.\n";
 				is_blacklisted = true; break; 
 			}
 		}
@@ -144,7 +237,7 @@ static void appendInstCountCalls(Module& M) {
 				assert(false);
 			}
 			size = bb_inst_counts[bb];
-			errs() << "bb = " << size << "\n";
+//			errs() << "bb = " << size << "\n";
 			std::vector<Value*> args;
 			args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),
 				size));
@@ -162,6 +255,38 @@ static void appendInstCountCalls(Module& M) {
 			assert(instcnt_call);
 		}
 	}
+}
+
+// 20130709: This feature is added to ensure that
+//   fault IDs and actually injected fault sites match
+static void printFaultSiteInfo() {
+	FILE* fs_f = fopen("fault_sites.txt", "w");
+	if(!fs_f) fs_f = stderr;
+	fprintf(fs_f, "FaultSiteID\tType\tInstruction\n");
+	for(std::map<int, std::pair<std::string, FaultType> >::iterator itr = g_fault_sites.begin(); itr != g_fault_sites.end(); itr++) {
+		std::string inst_string;
+
+		// Index of fault
+		int idx = (*itr).first;
+
+		// Type of fault
+		FaultType fault_type = (*itr).second.second;
+		std::string fault_type_sz;
+		switch(fault_type) {
+			case DYN_FAULT_PTR:
+				fault_type_sz = "Pointer"; break;
+			case DYN_FAULT_DATA:
+				fault_type_sz = "Data";    break;
+			default:
+				assert(0);
+		}
+
+		// Instruction dump (column 3)
+		std::string inst_str = (*itr).second.first;
+
+		fprintf(fs_f, "%d\t%s\t%s\n", idx, fault_type_sz.c_str(), inst_str.c_str());
+	}
+	fclose(fs_f);
 }
 
 // Description of this function:
@@ -199,7 +324,6 @@ Value* CorruptPointer(Value* inst,
 	}
 	if(!iPtr) assert(0);
 	std::vector<Value*> args = _args;
-	g_fault_index++;
 	// Increment g_fault_index
 	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),g_fault_index));
 	std::vector<Value*>::iterator itr;
@@ -238,16 +362,19 @@ std::vector<std::string> splitAtSpace(std::string spltStr){
 	std::vector<std::string> strLst;
 	std::istringstream isstr(spltStr);
 	copy(std::istream_iterator<std::string>(isstr), 
-			 std::istream_iterator<std::string>(), 
-			 std::back_inserter<std::vector<std::string> >(strLst));
+		std::istream_iterator<std::string>(), 
+		std::back_inserter<std::vector<std::string> >(strLst));
 	return strLst;
 }
 
 /*Injects dynamic fault(s) into data register*/
 bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 {
-	if(I == NULL)		
-		return false;
+	if(I == NULL) return false;
+
+	// Log Fault Site information
+	logFaultSiteInfo(I, fault_index, DYN_FAULT_DATA);
+
 	/*Locate the instruction I in the basic block BB*/  
 	Value *inst = &(*I);    
 	if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
@@ -344,22 +471,70 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		User* tcmpOp = &*cmpOp;
 		args.push_back(tcmpOp->getOperand(opPos));
 		CallI = NULL;
-		/*integer data*/
+		
+		// To make the code more succinct!
+		#define STR(x) #x
+		#define FuncCorrupt(nbits) func_corruptIntData_ ## nbits ## bit
+		#define VarCorrupt(nbits) call_corruptIntData_ ## nbits ## bit
+		#define InjectInt(nbits) \
+			CallI = CallInst::Create(FuncCorrupt(nbits), args, STR(Corrupt(nbits)), I); \
+			assert(CallI); \
+			CallI->setCallingConv(CallingConv::C);
+		
 		if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(16)){          
-			CallI = CallInst::Create(func_corruptIntData_16bit,args,"call_corruptIntData_16bit",I);
+			InjectInt(16);
+		} else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(32)){          
+			InjectInt(32);
+		} else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(64)){
+			InjectInt(64);
+		} else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(1)) {
+			// The following code has not been tested
+			// "Boolean" types should be handled differently b/c there is no "bool" in C
+			assert(!(BI == BB->end())); // the last instr. in a BB shall not be a BOOL value.
+			BINext = BI; BINext++;
+			Instruction* INext = &(*BINext);
+			CastInst* cast8 = CastInst::CreateZExtOrBitCast(I, IntegerType::getInt8Ty(getGlobalContext()), "boolToChar", INext);
+			CallI = CallInst::Create(func_corruptIntData_8bit, args, "call_corruptIntData_8bits", cast8);
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
+			CastInst* cast1 = CastInst::CreateTruncOrBitCast(CallI, IntegerType::getInt1Ty(getGlobalContext()), "charToBool", INext);
+			BI->setOperand(opPos, cast1);
+			return true;
+		} else { // OKay, it's a pointer....
+			// Convert to 64-bit integer, corrupt it, then convert back
+			
+			BINext = BI; BINext++;
+			Type* the_op_type = tcmpOp->getOperand(opPos)->getType();
+			if(the_op_type->isPointerTy()) {
+				Value* i_addr = new PtrToIntInst(
+					tcmpOp->getOperand(opPos),
+					IntegerType::getInt64Ty(getGlobalContext()),
+						tcmpOp->getOperand(opPos)->getName(),
+					I
+				);
+				if(!i_addr) { assert(0 && "Cannot PtrToInt inst. This shall not happen!"); }
+				args.pop_back();
+				args.push_back(i_addr);
+				CallI = CallInst::Create(func_corruptIntData_64bit,
+					args,
+					tcmpOp->getOperand(opPos)->getName(),
+					I
+				);
+				Value* corrupted_ptr = new IntToPtrInst(
+					CallI,
+					the_op_type,
+					tcmpOp->getOperand(opPos)->getName(),
+					I
+				);
+				// Blacklist them (do not corrupt them once more in ptr corruption)
+				corrupted_ptrs.insert(CallI);
+				corrupted_ptrs.insert((Instruction*)(tcmpOp->getOperand(opPos)));
+				corrupted_ptrs.insert((Instruction*)(corrupted_ptr));
+				cmpOp->setOperand(opPos, corrupted_ptr);
+				return true;
+			}
 		}
-		else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(32)){          
-			CallI = CallInst::Create(func_corruptIntData_32bit,args,"call_corruptIntData_32bit",I);
-			assert(CallI);
-			CallI->setCallingConv(CallingConv::C);
-		}
-		else if(tcmpOp->getOperand(opPos)->getType()->isIntegerTy(64)){
-			CallI = CallInst::Create(func_corruptIntData_64bit,args,"call_corruptIntData_64bit",I);
-			assert(CallI);
-			CallI->setCallingConv(CallingConv::C);
-		}
+		
 		
 		/*Float Data*/
 		if(tcmpOp->getOperand(opPos)->getType()->isFloatTy()){
@@ -379,6 +554,7 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		} else {
 			errs() << "[DataReg_Dyn CmpInst not injected] "
 				<< *(cmpOp->getType()) << "\n";
+			cmpOp->dump();
 			return false;
 		}
 		assert(0);
@@ -560,6 +736,9 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 	if(I==NULL) return false;
 	CallInst* CallI=NULL;
 
+	// Log fault site information
+	logFaultSiteInfo(I, fault_index, DYN_FAULT_PTR);
+
 	/*Build argument list before calling Corrupt function*/
 	std::vector<Value*> args; args.clear();
 	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),fault_index));
@@ -692,13 +871,20 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 }/*end InjectError_PtrError*/
 /******************************************************************************************************************************/
 
+// Use-def chain graph information
+void recordUseDefChain(Module& M);
+
 /*Dynamic Fault Injection LLVM Pass*/
 namespace {
 class dynfault : public ModulePass {
+private:
 public:
 	static char ID; 
 	dynfault() : ModulePass(ID) {}
 	virtual bool runOnModule(Module &M) {
+		readFunctionInjWhitelist();
+		recordUseDefChain(M);
+
 		errs() << "Haha\n";
 		srand(time(NULL));
 		if(byte_val < 0 || byte_val > 7) 
@@ -800,12 +986,15 @@ public:
 				isFunctionNameBlacklisted(cstr.c_str()) )
 				continue;
 			Function *F=NULL;
+			bool is_in_whitelist = true;
 			/*if the user defined function list is empty or the currently selected function is in the list of
 			 * user defined function list then consider the function for fault injection*/
-			if(!func_list.compare("") || std::find(flist.begin(), flist.end(), cstr)!=flist.end())
-				F = it;	
-			else
+			if(!func_list.compare("") || std::find(flist.begin(), flist.end(), cstr)!=flist.end()) {
+				F = it;
+				if(!shouldInjectFunction(F)) is_in_whitelist = false;
+			} else {
 				continue;
+			}
 			if(F->begin()==F->end())
 				continue;
 
@@ -814,60 +1003,68 @@ public:
 			for(Function::iterator fi = F->begin(); fi!=F->end(); fi++) {
 				BasicBlock& BB = *fi;
 				unsigned vuln = 0;
-				for(BasicBlock::iterator bi = BB.begin(); bi!=BB.end(); bi++) {
-					unsigned vuln_delta = 0;
-					Instruction* I = &(*bi);
-					Value *in = &(*I);  
-					Instruction* p_in = &*I;
-					if(in == NULL)
-						continue;
-					if(data_err) {                           
-						if(isa<BinaryOperator>(in) || 
-							isa<CmpInst>(in)        ||
-							isa<StoreInst>(in)      ||
-							isa<LoadInst>(in))
-						{
-							ilist.insert(p_in);
-							vuln_delta = 1;
+				if(is_in_whitelist) {
+					for(BasicBlock::iterator bi = BB.begin(); bi!=BB.end(); bi++) {
+						unsigned vuln_delta = 0;
+						Instruction* I = &(*bi);
+						Value *in = &(*I);  
+						Instruction* p_in = &*I;
+						if(in == NULL)
+							continue;
+						if(data_err) {                           
+							if(isa<BinaryOperator>(in) || 
+								isa<CmpInst>(in)        ||
+								isa<StoreInst>(in)      ||
+								isa<LoadInst>(in))
+							{
+								ilist.insert(p_in);
+								vuln_delta = 1;
+							}
 						}
-					}
-					if(ptr_err) {
-						if(isa<StoreInst>(in) || 
-						isa<LoadInst>(in)  ||
-						isa<CallInst>(in)  ||
-						isa<AllocaInst>(in)) 
-						{
-							ilist.insert(p_in);
-							vuln_delta = 1;
+						if(ptr_err) {
+							if(isa<StoreInst>(in) || 
+							isa<LoadInst>(in)  ||
+							isa<CallInst>(in)  ||
+							isa<AllocaInst>(in)) 
+							{
+								ilist.insert(p_in);
+								vuln_delta = 1;
+							}
 						}
+						vuln += vuln_delta;
 					}
-					vuln += vuln_delta;
 				}
-				bb_inst_counts[&BB] = vuln;
+				bb_inst_counts[&BB] = (is_in_whitelist) ? vuln : 0; // 20130711: I have to remove this b/c this is not consistent with fault_index
 			}
 			/*Check if instruction list is empty*/
 			if(ilist.empty())
 				continue;
 
 			lstsize = ilist.size();
-			while(!ilist.empty()) {
-				Instruction* inst = *(ilist.begin());
-				ilist.erase(inst);         
+
+//			while(!ilist.empty()) {
+			for(std::set<Instruction*>::iterator itr = ilist.begin(); itr != ilist.end(); itr++) {
+				fprintf(stderr, "%d faults injected\r", g_fault_index);
+//				Instruction* inst = *(ilist.begin());
+				Instruction* inst = *itr;
 				if(ptr_err) {
 					g_fault_index++;
-					InjectError_PtrError_Dyn(inst, g_fault_index);
+					if(InjectError_PtrError_Dyn(inst, g_fault_index))
+						injected_fault_indices.insert(g_fault_index);
 				}
 				if(data_err) {
 					g_fault_index++;
-					InjectError_DataReg_Dyn(inst, g_fault_index);
+					if(InjectError_DataReg_Dyn(inst, g_fault_index))
+						injected_fault_indices.insert(g_fault_index);
 				}               
 			}/*end for*/
 		}/*end for*/
 		appendInstCountCalls(M);
 		
-		// Insert call to initialize fault injection campaign
+		// Insert call to initialize fault injection campaign if there's main()
+		//   when the injected program starts
+		if(func_main)
 		{
-			assert(func_main);
 			BasicBlock* b = ((Function*)(func_main))->begin();
 			Instruction* first = b->begin();
 			
@@ -879,6 +1076,11 @@ public:
 				args, "", first);
 			assert(call_init);
 		}
+
+		// Print out fault site statistics.
+//		printFaultSiteInfo();
+		writeFaultSiteDOTGraph();
+
 		return false;
 	}/*end function definition*/
 };/*end class definition*/
@@ -1178,3 +1380,225 @@ char staticfault::ID = 0;
 static RegisterPass<staticfault> F1("staticfault", "Static Fault Injection emulating permanent hardware error behavior");
 
 /******************************************************************************************************************************/
+
+const char* getMyTypeName(const Value* v) {
+	if(isa<BinaryOperator>(v)) {
+		return "BinOp";
+	} else if(isa<CmpInst>(v)) {
+		return "Cmp";
+	} else if(isa<StoreInst>(v)) {
+		return "ST";
+	} else if(isa<LoadInst>(v)) {
+		return "LD";
+	} else if(isa<GetElementPtrInst>(v)) {
+		return "GEP";
+	} else if(isa<ReturnInst>(v)) {
+		return "Ret";
+	} else if(isa<BranchInst>(v)) {
+		return "Br";
+	} else if(isa<PHINode>(v)) {
+		return "Phi";
+	} else if(isa<CallInst>(v)) {
+		return "Call";
+	} else if(isa<ICmpInst>(v)) {
+		return "ICmp";
+	} else if(isa<AllocaInst>(v)) {
+		return "Alloca";
+	} else return "--";
+}
+
+// Experimental
+// I need the graph, really
+void recordUseDefChain(Module& M) {
+	errs() << "Backup ...... \n";
+	unsigned long nodeid = 0;
+	Module::FunctionListType& funcList = M.getFunctionList();
+
+	// Pass 1: Give every instruction a node ID (node in the graph for visualization)
+	for(Module::iterator itr = funcList.begin(); itr != funcList.end(); itr++) {
+		Function& F = *itr;
+		std::string s = F.getName().str();
+		const Function* pF = (const Function*)(&F);
+		if(isFunctionNameBlacklisted(s.c_str()) || (!shouldInjectFunction(pF))) {
+			continue;
+		}
+		std::list<const BasicBlock*> bbs;
+		Function::BasicBlockListType& bbList = F.getBasicBlockList();
+		for(Function::iterator itr1 = bbList.begin(); itr1 != bbList.end(); itr1++) {
+			BasicBlock& BB = *itr1;
+			BasicBlock* pBB = &(BB);
+			bbs.push_back((const BasicBlock*)pBB);
+			std::list<unsigned long> nodeids; nodeids.clear();
+			for(BasicBlock::iterator itr2 = BB.begin(); itr2 != BB.end(); itr2++) {
+				const Value* inst = (const Value*)(&(*itr2));
+				#ifdef TOMMY_TEST
+				test0[inst] = instToString(inst);
+				#endif
+				fault_site_to_nodeid[inst] = nodeid;
+				nodeids.push_back(nodeid);
+
+				node_type_names[nodeid] = getMyTypeName(inst);
+
+				if(isa<ReturnInst>(inst)) {// || isa<BranchInst>(inst)) {
+					is_terminator.insert(nodeid);
+				}
+				nodeid ++;
+			}
+			nodeids_in_basicblocks[pBB] = nodeids;
+			std::string bb_name = pBB->getName().str();
+			bb_names[pBB] = bb_name;
+		}
+		bbs_in_funcs[pF] = bbs;
+	}
+	num_nodes = nodeid;
+	errs() << is_terminator.size() << " terminators\n";
+
+	// Pass 2: Record all the use-def edges
+	for(Module::iterator itr = funcList.begin(); itr != funcList.end(); itr++) {
+		Function& F = *itr;
+		const Function* f = (const Function*)(&F);
+		if(isFunctionNameBlacklisted(F.getName().str().c_str()) ||
+			(!shouldInjectFunction(f))) continue;
+		Function::BasicBlockListType& bbList = F.getBasicBlockList();
+		fprintf(stderr, "%s\n", F.getName().str().c_str());
+		for(Function::iterator itr1 = bbList.begin(); itr1 != bbList.end(); itr1++) {
+			BasicBlock& BB = *itr1;
+			for(BasicBlock::iterator itr2 = BB.begin(); itr2 != BB.end(); itr2++) {
+				const Instruction* inst = &(*itr2);
+				const Value* def = (const Value*)(inst);
+
+				if(isa<PHINode>(inst)) {
+					PHINode* phinode = (PHINode*)(inst);
+					unsigned n_incoming = phinode->getNumIncomingValues();
+					unsigned long to_nid = fault_site_to_nodeid.at((Value*)inst);
+					if(n_incoming > 0) {
+						for(unsigned i=0; i<n_incoming; i++) {
+							Value* inc = phinode->getIncomingValue(i);
+							if(fault_site_to_nodeid.find(inc) == fault_site_to_nodeid.end()) {
+								continue; // A PHI node may have a "constant" incoming value: e.g. %i.07.i2 = phi i32 [ 0, %NumOfBitsSet.exit ], [ %14, %12 ]
+							}
+							unsigned long from_nid = fault_site_to_nodeid.at(inc);
+							is_in_chain.insert(from_nid);
+							is_in_chain.insert(to_nid);
+						}
+					}
+				}
+				
+				{
+					Instruction::const_use_iterator itr3_begin = inst->use_begin();
+					Instruction::const_use_iterator itr3_end   = inst->use_end();
+					for(Instruction::const_use_iterator itr3 = itr3_begin;
+						itr3 != itr3_end; itr3++) {
+						const User* user = *itr3;
+						const Value* use = dynamic_cast<const Value*>(user);
+						if(use) {
+							unsigned long def_nid = fault_site_to_nodeid.at(def);
+							unsigned long use_nid = fault_site_to_nodeid.at(use);
+							usedef_edge_list.push_back(std::make_pair(def_nid, use_nid));
+							is_in_chain.insert(def_nid);
+							is_in_chain.insert(use_nid);
+						}
+					}
+				}
+
+				if(isa<BranchInst>(inst)) { // Add an ety to branch_edge_list
+					BranchInst* br_inst = (BranchInst*)(inst);
+					unsigned n_succ = br_inst->getNumSuccessors();
+					for(unsigned i=0; i<n_succ; i++) {
+						BasicBlock* succ = br_inst->getSuccessor(i);
+						Instruction* first_non_phi = succ->getFirstNonPHI();
+						unsigned long from_nid = fault_site_to_nodeid.at((Value*)(inst));
+						unsigned long to_nid   = fault_site_to_nodeid.at((Value*)(first_non_phi));
+						branch_edge_list.push_back(std::make_pair(from_nid, to_nid));
+					}
+				}
+			}
+		}
+	}
+
+	errs() << "[recordUseDefChain] " << usedef_edge_list.size() << " entries in use-def graph.\n";
+
+}
+
+void writeFaultSiteDOTGraph() {
+	errs() << "Printing out DOT graph.\n";
+
+	FILE* out = fopen("usedefchain.dot", "w");
+	fprintf(out, "digraph G {\tnode [shape=rectangle;] \n");
+	// Cluster idx
+	int cluster_idx = 0;
+	for(std::map<const Function*, std::list<const BasicBlock*> >::const_iterator itr0 = bbs_in_funcs.begin();
+		itr0 != bbs_in_funcs.end(); itr0++) {
+		const std::list<const BasicBlock*> blist = itr0->second;
+		if(!shouldInjectFunction(itr0->first)) continue;
+		std::string s = itr0->first->getName().str();
+		fprintf(stderr, "%s\n", s.c_str());
+		fprintf(out, "\tsubgraph cluster%d { label=\"%s\"\n", cluster_idx, s.c_str());
+		cluster_idx++;
+		for(std::list<const BasicBlock*>::const_iterator itr = blist.begin(); itr != blist.end(); itr++) {
+			const BasicBlock* pBB = *itr;
+			if(nodeids_in_basicblocks.find(pBB) == nodeids_in_basicblocks.end()) continue;
+			std::list<unsigned long>& nodes = nodeids_in_basicblocks[pBB];
+			std::string bb_name = bb_names[pBB];
+
+			std::list<unsigned long> filtered;
+			for(std::list<unsigned long>::iterator itr1 = nodes.begin(); itr1 != nodes.end(); itr1++) {
+				unsigned long nodeid = *itr1;
+				if(is_in_chain.find(nodeid) != is_in_chain.end())
+					filtered.push_back(nodeid);
+			}
+
+			if(filtered.size() > 0) {
+//				fprintf(out, "\t\tsubgraph cluster%d { label=\"%s\" ", cluster_idx, bb_name.c_str());
+//				cluster_idx++;
+				for(std::list<unsigned long>::iterator itr1 = filtered.begin(); itr1 != filtered.end(); itr1++) {
+					fprintf(out, "Node%lu; ", *itr1);
+				}
+//				fprintf(out, "}\n");
+			}
+		}
+		fprintf(out, "\t}\n");
+	}
+
+	for(unsigned long i=0; i<num_nodes; i++) { 
+		if(is_in_chain.find(i) != is_in_chain.end()) {
+			fprintf(out, "\tNode%lu [", i);
+			bool should_color = false;
+			bool should_double_circle = false;
+			int fault_idx = -1;
+			if(nodeid_to_fault_site_id.find(i) != nodeid_to_fault_site_id.end()) {
+				fault_idx = nodeid_to_fault_site_id[i];
+				if(injected_fault_indices.find(fault_idx) !=
+					injected_fault_indices.end())
+					should_color = true;
+			}
+			if(is_terminator.find(i) != is_terminator.end())
+				should_double_circle = true;
+			if(should_color) {
+				fprintf(out, "label=\"%s\\n(FS%d)\" color=\"red\"", node_type_names[i], fault_idx);
+			} else {
+				fprintf(out, "label=\"%s\"", node_type_names[i]);
+			}
+
+			if(should_double_circle) {
+				fprintf(out, " shape=\"doublecircle\"");
+			}
+
+			fprintf(out, "]\n");
+		}
+	}
+	for(std::list<std::pair<unsigned long, unsigned long> >::iterator itr =
+		usedef_edge_list.begin(); itr != usedef_edge_list.end(); itr++) {
+		unsigned long from = itr->first, to = itr->second;
+		fprintf(out, "\tNode%lu -> Node%lu\n", from, to);
+	}
+/*
+	for(std::list<std::pair<unsigned long, unsigned long> >::iterator itr =
+		branch_edge_list.begin(); itr != branch_edge_list.end(); itr++) {
+		unsigned long from = itr->first, to = itr->second;
+		fprintf(out, "\tNode%lu -> Node%lu [color=\"blue\"]\n", from, to);
+	}
+*/
+	fprintf(out, "}\n");
+	fclose(out);
+}

@@ -2,15 +2,17 @@
 /* Name        : Corrupt.c                                                                 */
 /* Description : This file contains code for corrupting data and pointer. It is linked at  */
 /*               compiled time to the target code where fault(s) need to be injected       */
-/*      									   */
+/*      																				   */
 /* Owner       : This tool is owned by Gauss Research Group at School of Computing,        */
 /*               University of Utah, Salt Lake City, USA.                                  */
 /*               Please send your queries to: gauss@cs.utah.edu                            */
 /*               Researh Group Home Page: http://www.cs.utah.edu/formal_verification/      */
-/* Version     : beta									   */
+/* Version     : beta																	   */
 /* Last Edited : 03/12/2013                                                                */
-/* Copyright   : Refer to LICENSE document for details 					   */
+/* Copyright   : Refer to LICENSE document for details 									   */
 /*******************************************************************************************/
+// Change on Jul 2: Byteval==-1 --> Randomly choose injection bit
+// Change on Jul 11: reads function name whitelist from funclist.txt; this will only enable error injection in those functions.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,14 +35,15 @@ int ijo_flag_add=0;
 int fault_injection_count=0;
 
 /*Fault Injection Statistics*/
-int fault_site_count=0;
-int fault_site_intData8bit=0;
-int fault_site_intData16bit=0;
-int fault_site_intData32bit=0;
-int fault_site_intData64bit=0;
-int fault_site_float32bit=0;
-int fault_site_float64bit=0;
-int fault_site_adr=0;
+int fault_site_count = 0;
+int fault_site_intData1bit = 0;
+int fault_site_intData8bit = 0;
+int fault_site_intData16bit = 0;
+int fault_site_intData32bit = 0;
+int fault_site_intData64bit = 0;
+int fault_site_float32bit = 0;
+int fault_site_float64bit = 0;
+int fault_site_adr = 0;
 
 // Program Statistics
 // "Instruction" here means LLVM instructions
@@ -80,15 +83,25 @@ void initializeFaultInjectionCampaign(int ef, int tf) {
 			while((read = getline(&line, &len, f))!=-1) {
 				if(sscanf(line, "-initial_next_fault_countdown=%d",
 					&next_fault_countdown) == 1) {
-					printf("   Next fault CountDown = %d\n",
-						next_fault_countdown);
+					printf("   Next fault CountDown = %d\n", next_fault_countdown);
+				}
+				if(sscanf(line, "-rand_flag=%d",
+					&rand_flag) == 1) {
+					printf("   Should initialize randseed = %d\n", rand_flag);
 				}
 			}
 			fclose(f);
 		}
 	}
+	
+	if(rand_flag) {
+		printf("   Initialized randomization seed.\n");
+		srand(time(0));
+	}
 }
 
+// This thing may be confusing
+//   because 1 instruction can have 2 error sites
 __attribute__((noinline))
 void __printInstCount() {
 	printf("Total # instructions exec'ed: %lu\n", num_insts_executed);
@@ -106,8 +119,8 @@ void printFaultInfo(const char* error_type, unsigned bPos, int fault_index,
 	 fprintf(stderr, "\n/*********************************End**************************************/\n");
 }
 
-
-int print_faultStatistics(int inject_once, int ef, int tf, int byte_val){
+__attribute__((destructor))
+int print_faultStatistics(){
 	printf("\n/*********************Program Statistics****************************/");
 	printf("\n# of instructions exec'ed: %lu\n", num_insts_executed);
 	printf("\n/*********************Fault Injection Statistics****************************/");
@@ -134,9 +147,26 @@ static int shouldInject(int ef, int tf) {
 	} else return 0;
 }
 
-char corruptIntData_8bit(int fault_index, int inject_once, int ef, int tf, int byte_val, char inst_data){
+char corruptIntData_1bit(int fault_index, int inject_once, int ef, int tf, int byte_val, char inst_data) {
 	unsigned int bPos;
+	
+	fault_site_count++;
+	fault_site_intData1bit++;
+	if(inject_once == 1)
+		ijo_flag_data=1;
+	if(ijo_flag_data == 1 && fault_injection_count>0)
+		return inst_data;
+	if(!shouldInject(ef, tf)) return inst_data;
+	
+	fault_injection_count++;
+	printFaultInfo("1-bit Int Data Error", bPos, fault_index, ef, tf);
+	if(inst_data) return 0x00;
+	else return 0xFF;
+}
 
+char corruptIntData_8bit(int fault_index, int inject_once, int ef, int tf, int byte_val, char inst_data) {
+	unsigned int bPos;
+	
 	fault_site_count++;
 	fault_site_intData8bit++;
 	if(inject_once == 1)
@@ -151,7 +181,7 @@ char corruptIntData_8bit(int fault_index, int inject_once, int ef, int tf, int b
 	return inst_data ^ (~((short)0x1<< (bPos)));   
 }
 
-short corruptIntData_16bit(int fault_index, int inject_once, int ef, int tf, int byte_val, short inst_data){
+short corruptIntData_16bit(int fault_index, int inject_once, int ef, int tf, int byte_val, short inst_data) {
 	 unsigned int bPos;
 	 int rp;
 	 fault_site_count++;
@@ -163,17 +193,17 @@ short corruptIntData_16bit(int fault_index, int inject_once, int ef, int tf, int
 	 
 	if(!shouldInject(ef, tf)) return inst_data;
 
-	 if(byte_val>1)
+	 if(byte_val >= 0)
 		bPos=(8*(byte_val%2))+rand()%8;
 	 else
-		bPos=(8*byte_val)+rand()%8;
+		bPos=rand() % 16;
 
 	 fault_injection_count++;
 	 printFaultInfo("16-bit Int Data Error", bPos, fault_index, ef, tf);
 	return inst_data ^ (~((short)0x1<< (bPos)));   
 }
 
-int corruptIntData_32bit(int fault_index, int inject_once, int ef, int tf, int byte_val, int inst_data){
+int corruptIntData_32bit(int fault_index, int inject_once, int ef, int tf, int byte_val, int inst_data) {
 	 unsigned int bPos;
 	 int rp;
 	 fault_site_count++;
@@ -185,110 +215,124 @@ int corruptIntData_32bit(int fault_index, int inject_once, int ef, int tf, int b
 			 return inst_data;
 	 
 	if(!shouldInject(ef, tf)) return inst_data;
-	 if(byte_val>3)
+		if(byte_val >= 0)
 			bPos=(8*(byte_val%4))+rand()%8;
-	 else
-			bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
-	 printFaultInfo("32-bit Int Data Error", bPos, fault_index, ef, tf);
+		else
+			bPos=rand() % 32;
+	fault_injection_count++;
+	printFaultInfo("32-bit Int Data Error", bPos, fault_index, ef, tf);
 	return inst_data ^ (~((int)0x1<< (bPos)));   
 }
 
-float corruptFloatData_32bit(int fault_index, int inject_once, int ef, int tf, int byte_val, float inst_data){
-	 unsigned int bPos;
-	 int rp;
-	 fault_site_count++;
-	 fault_site_float32bit++;
-	 if(inject_once == 1)
-		 ijo_flag_data=1;
+float corruptFloatData_32bit(int fault_index, int inject_once, int ef, int tf, int byte_val, float inst_data) {
+	unsigned int bPos;
+	int rp;
+	fault_site_count++;
+	fault_site_float32bit++;
+	if(inject_once == 1)
+		ijo_flag_data=1;
 
-	 if(ijo_flag_data == 1 && fault_injection_count>0)
-			 return inst_data;
+	if(ijo_flag_data == 1 && fault_injection_count>0)
+		return inst_data;
 	 
 	if(!shouldInject(ef, tf)) return inst_data;
-	 if(byte_val>3)
+		if(byte_val>3)
 			bPos=(8*(byte_val%4))+rand()%8;
-	 else
-			bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
-	 printFaultInfo("32-bit IEEE Float Data Error", bPos, fault_index, ef, tf);
-	 return (float)((int)inst_data ^ (~((int)0x1<< (bPos))));   
+		else
+			bPos = rand() % 32;
+	fault_injection_count++;
+	printFaultInfo("32-bit IEEE Float Data Error", bPos, fault_index, ef, tf);
+	return (float)((int)inst_data ^ (~((int)0x1<< (bPos))));   
 }
 
-long long corruptIntData_64bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, long long inst_data){
-	 unsigned int bPos;
-	 int rp;
-	 fault_site_count++;
-	 fault_site_intData64bit++;
-	 if(inject_once == 1)
+long long corruptIntData_64bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, long long inst_data) {
+	unsigned int bPos;
+	int rp;
+	fault_site_count++;
+	fault_site_intData64bit++;
+	if(inject_once == 1)
 		 ijo_flag_data=1;
 
-	 if(ijo_flag_data == 1 && fault_injection_count>0)
+	if(ijo_flag_data == 1 && fault_injection_count>0)
 			 return inst_data;        
 	 
 	if(!shouldInject(ef, tf)) return inst_data;
-	 bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
-	 printFaultInfo("64-bit Int Data Error", bPos, fault_index, ef, tf);
+	
+	if(byte_val >= 0)
+		bPos=(8*byte_val)+rand()%8;
+	else
+		bPos = rand() % 64;
+	
+	fault_injection_count++;
+	printFaultInfo("64-bit Int Data Error", bPos, fault_index, ef, tf);
 	return inst_data ^ (~((long long)0x1<< (bPos)));   
 }
 
 double corruptFloatData_64bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, double inst_data){
-	 unsigned int bPos;
-	 int rp;
-	 fault_site_count++;
-	 fault_site_float64bit++;
-	 if(inject_once == 1)
-		 ijo_flag_data=1;
+	unsigned int bPos;
+	int rp;
+	fault_site_count++;
+	fault_site_float64bit++;
+	if(inject_once == 1)
+		ijo_flag_data=1;
 
-	 if(ijo_flag_data == 1 && fault_injection_count>0)
-			 return inst_data;        
+	if(ijo_flag_data == 1 && fault_injection_count>0)
+		return inst_data;        
 
 	if(!shouldInject(ef, tf)) return inst_data;
-	 bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
-	 printFaultInfo("64-bit IEEE Float Data Error", bPos, fault_index, ef, tf);
-	 return (double)((long long)inst_data ^ (~((long long)0x1<< (bPos))));   
+	if(byte_val >= 0)
+		bPos = (8*byte_val)+rand()%8;
+	else
+		bPos = rand() % 64;
+	fault_injection_count++;
+	printFaultInfo("64-bit IEEE Float Data Error", bPos, fault_index, ef, tf);
+	return (double)((long long)inst_data ^ (~((long long)0x1<< (bPos))));   
 }
 
 int* corruptIntAdr_32bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, int* inst_add){
-	 unsigned int bPos;
-	 int rp;
-	 fault_site_count++;
-	 fault_site_adr++;
-	 if(inject_once == 1)
-		 ijo_flag_add=1;
+	unsigned int bPos;
+	int rp;
+	fault_site_count++;
+	fault_site_adr++;
+	if(inject_once == 1)
+		ijo_flag_add=1;
 
-	 if(ijo_flag_add == 1 && fault_injection_count>0)
-			 return inst_add;           
+	if(ijo_flag_add == 1 && fault_injection_count>0)
+		return inst_add;           
 
 	if(!shouldInject(ef, tf)) return inst_add;
 
-	 bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
+	if(byte_val >= 0) 
+		bPos = (8*byte_val)+rand()%8;
+	else
+		bPos = rand() % 64;
+	fault_injection_count++;
 
-	 printFaultInfo("Ptr32 Error", bPos, fault_index, ef, tf);
-	 return (int *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
+	printFaultInfo("Ptr32 Error", bPos, fault_index, ef, tf);
+	return (int *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
 }
 
 long long* corruptIntAdr_64bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, long long* inst_add){
-	 unsigned int bPos;
-	 int rp;
-	 fault_site_count++;
-	 fault_site_adr++;
-	 if(inject_once == 1)
-		 ijo_flag_add=1;
+	unsigned int bPos;
+	int rp;
+	fault_site_count++;
+	fault_site_adr++;
+	if(inject_once == 1)
+		ijo_flag_add=1;
 
-	 if(ijo_flag_add == 1 && fault_injection_count>0)
-			 return inst_add;           
+	if(ijo_flag_add == 1 && fault_injection_count>0)
+		return inst_add;           
 
 	if(!shouldInject(ef, tf)) return inst_add;
 
-	 bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
+	if(byte_val >= 0)
+		bPos=(8*byte_val)+rand()%8;
+	else
+		bPos = rand() % 64;
+	fault_injection_count++;
 
-	 printFaultInfo("Ptr64 Error", bPos, fault_index, ef, tf);
-	 return (long long *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
+	printFaultInfo("Ptr64 Error", bPos, fault_index, ef, tf);
+	return (long long *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
 }
 
 float* corruptFloatAdr_32bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, float* inst_add){
@@ -304,30 +348,36 @@ float* corruptFloatAdr_32bit(int fault_index, int inject_once, int ef, int tf,  
 
 	if(!shouldInject(ef, tf)) return inst_add;
 
-	 bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
+	if(byte_val >= 0)
+		bPos=(8*(byte_val%4))+rand()%8;
+	else
+		bPos = rand() % 32;
+	fault_injection_count++;
 
-	 printFaultInfo("Float Addr32 Error", bPos, fault_index, ef, tf);
-	 return (float *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
+	printFaultInfo("Float Addr32 Error", bPos, fault_index, ef, tf);
+	return (float *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
 }
 
 double* corruptFloatAdr_64bit(int fault_index, int inject_once, int ef, int tf,  int byte_val, double* inst_add){
-	 unsigned int bPos;
-	 int rp;
-	 fault_site_count++;
-	 fault_site_adr++;
-	 if(inject_once == 1)
-		 ijo_flag_add=1;
+	unsigned int bPos;
+	int rp;
+	fault_site_count++;
+	fault_site_adr++;
+	if(inject_once == 1)
+		ijo_flag_add=1;
 
-	 if(ijo_flag_add == 1 && fault_injection_count>0)
-			 return inst_add;           
+	if(ijo_flag_add == 1 && fault_injection_count>0)
+		return inst_add;           
 
 	if(!shouldInject(ef, tf)) return inst_add;
 
-	 bPos=(8*byte_val)+rand()%8;
-	 fault_injection_count++;
-	 printFaultInfo("Float Addr64 Error", bPos, fault_index, ef, tf);
-	 return (double *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
+	if(byte_val >= 0)
+		bPos=(8*byte_val)+rand()%8;
+	else
+		bPos = rand() % 64;
+	fault_injection_count++;
+	printFaultInfo("Float Addr64 Error", bPos, fault_index, ef, tf);
+	return (double *)((long long)inst_add ^ (~((long long)0x1<< (bPos))));   
 }
 
 #ifdef __cplusplus
