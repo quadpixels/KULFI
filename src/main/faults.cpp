@@ -1,9 +1,12 @@
-// Modified by Tommy
+// 20130717: Add counting to end of BB; shall add another to the beginning of BB,
+// 20130723: Mock implementation of "nextFaultInThisBB" ---->  BB means original BB ! [pointers to original BB's must be preserved]
+//   13:32 It seems to work somehow. Verifying. Proceeding cautiously.
+// and verify counting of fault sites
 /*******************************************************************************************/
 /* Name        : Kontrollable Utah LLVM Fault Injector (KULFI) Tool                        */
 /*											   										       */
 /* Owner       : This tool is owned by Gauss Research Group at School of Computing,        */
-/*               University of Utah, Salt Lake City, USA.                                  */
+/*               University of Utah, Salt Lake City, USA.     d                             */
 /*               Please send your queries to: gauss@cs.utah.edu                            */
 /*               Researh Group Home Page: http://www.cs.utah.edu/formal_verification/      */
 /* Version     : beta 									   								   */
@@ -44,7 +47,12 @@
 // Log the information of fault sites
 //   in case they become useful afterwards
 
+// Enable this macro to use old code
+// Otherwise, use the code on 2013-07-23
+//#define IGNORE_20130723_CHANGES
+
 using namespace llvm;
+const char* getMyTypeName(const Value* v);
 
 static cl::opt<std::string> func_list("fn", cl::desc("Name(s) of the function(s) to be targeted"), cl::value_desc("func1 func2 func3"), cl::init(""), cl::ValueRequired);
 static cl::opt<int> ef("ef", cl::desc("expected number of fault occurence"), cl::value_desc("Any value greater than or equal to 0 and less than or equal to tf"), cl::init(100), cl::ValueRequired);
@@ -100,10 +108,11 @@ Value* func_corruptIntAdr_64bit;
 Value* func_corruptFloatAdr_32bit;
 Value* func_corruptFloatAdr_64bit;
 Value* func_print_faultStatistics;
-Value* func_incrementInstCount;
+Value* func_incrementFaultSitesEnumerated;
 Value* func_printInstCount;
 Value* func_initFaultInjectionCampaign;
 Value* func_main;
+Value* func_isNextFaultInThisBB;
 std::string cstr=""; /*stores fault site name used by fault injection pass*/
 unsigned int lstsize=0; /*Stores instruction list used by static fault injection pass*/
 
@@ -116,7 +125,7 @@ enum FaultType {
 static std::map<int, std::pair<std::string, FaultType> > g_fault_sites;
 
 std::set<Instruction*> corrupted_ptrs;
-std::map<BasicBlock*, unsigned> bb_inst_counts;
+std::map<BasicBlock*, unsigned> bb_fs_counts; // Fault Site count of each BB
 
 static std::string instToString(const Instruction* inst) {
 	std::string str;
@@ -143,6 +152,13 @@ std::map<unsigned long, int> nodeid_to_fault_site_id;
 std::map<unsigned long, const char*> node_type_names;
 std::list<std::pair<unsigned long, unsigned long> > usedef_edge_list;
 std::list<std::pair<unsigned long, unsigned long> > branch_edge_list;
+
+// Predicate "shall we inject errors in THIS BB?"
+//   Is a Boolean value.
+std::map<const BasicBlock*, const Value*> bb_to_pred;
+// There should not be "incrementFaultSiteCount"s for
+// "alternative BB" and "next BB"'s!
+std::set<const BasicBlock*> blacklisted_bbs;
 void writeFaultSiteDOTGraph();
 
 // Don't use this routine. It's painfully slow!
@@ -175,7 +191,28 @@ static const char* blacklist[] = {
 	"__printInstCount",
 	"printFaultInfo",
 	"initializeFaultInjectionCampaign",
-	"shouldInject"
+	"shouldInject",
+	"incrementFaultSiteHit",
+	"incrementInstCount",
+	"__printInstCount",
+	"corruptIntData_16bit",
+	"corruptIntData_32bit",
+	"corruptIntData_64bit",
+	"corruptIntData_8bit",
+	"corruptIntData_1bit",
+	"corruptFloatData_32bit",
+	"corruptFloatData_64bit",
+	"corruptIntAdr_32bit",
+	"corruptIntAdr_64bit",
+	"corruptFloatAdr_32bit",
+	"corruptFloatAdr_64bit",
+	"print_faultStatistics",
+	"printFaultInfo",
+	"main",
+	"initializeFaultInjectionCampaign",
+	"shouldInject",
+	"onCountDownReachesZero",
+	"isNextFaultInThisBB"
 };
 
 // Add calls to some accounting function for keeping track of # of insts
@@ -212,46 +249,57 @@ static bool isFunctionNameBlacklisted(const char* fn) {
 	return false;
 }
 
-// Counts how many fault sites there are in this module
+static void addPredicateDecls(Module& M) {
+
+}
+
+// Counts how many fault sites there are in the BasicBlocks in this Module.
 static void appendInstCountCalls(Module& M) {
 	// Call incrementInstCount using the constants as arguments.
 	Module::FunctionListType &fl = M.getFunctionList();
 	for(Module::iterator it = fl.begin(); it!=fl.end(); it++) {
 		Function& F = *it;
 		std::string cstr = it->getName().str();
-		bool is_blacklisted = false;
-		for(unsigned i=0; i<sizeof(blacklist1)/sizeof(char*); i++) {
+//		bool is_blacklisted = false;
+//		for(unsigned i=0; i<sizeof(blacklist1)/sizeof(char*); i++) {
 //			errs() << cstr << ",\n";
-			if(cstr == blacklist1[i]) { 
-	//			errs() << "Blacklisted.\n";
-				is_blacklisted = true; break; 
-			}
-		}
+//			if(cstr == blacklist1[i]) { 
+//				errs() << "Blacklisted.\n";
+//				is_blacklisted = true; break; 
+//			}
+//		}
+
+		bool is_blacklisted = isFunctionNameBlacklisted(cstr.c_str());
+
 		if(is_blacklisted) continue;
 		for(Function::iterator bi = F.begin(); bi!=F.end(); bi++) {
 			BasicBlock* bb = &(*bi);
-			Instruction* last_inst = &(bb->back());
+			if(blacklisted_bbs.find(bb) != blacklisted_bbs.end()) continue;
+
+			Instruction* first_inst = bb->getFirstNonPHI();
 			unsigned size = 0;
-			if(!(bb_inst_counts.find(bb) != bb_inst_counts.end())) {
+			if(!(bb_fs_counts.find(bb) != bb_fs_counts.end())) {
 				bb->getParent()->dump();
 				assert(false);
 			}
-			size = bb_inst_counts[bb];
+			size = bb_fs_counts[bb];
+			if(size < 1) continue;
 //			errs() << "bb = " << size << "\n";
 			std::vector<Value*> args;
 			args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),
 				size));
-			CallInst* inc_call = CallInst::Create(func_incrementInstCount, args,
-				"", last_inst);
+			CallInst* inc_call = CallInst::Create(func_incrementFaultSitesEnumerated, args,
+				"", first_inst);
 			assert(inc_call);
-
+			// Do not inject into this call
+			corrupted_ptrs.insert(inc_call);
 		}
 
 		if(cstr == "main") { // Outro
 			BasicBlock* bb = &(it->back());
-			Instruction* last_inst = &(bb->back());
+			Instruction* first_inst = bb->getFirstNonPHI();
 			CallInst* instcnt_call = CallInst::Create(func_printInstCount, 
-				std::vector<Value*>(), "", last_inst);
+				std::vector<Value*>(), "", first_inst);
 			assert(instcnt_call);
 		}
 	}
@@ -358,6 +406,74 @@ Value* CorruptPointer(Value* inst,
 	return corruptedPtr;
 }
 
+#ifndef IGNORE_20130723_CHANGES
+static PHINode* createBranchForCorruptInst(Value* corrupted,
+	Value* original) {
+
+	PHINode* corruptValPhi = NULL;
+	BasicBlock *injBB, *prevBB, *nextBB;
+
+	prevBB = ((Instruction*)corrupted)->getParent();
+	BasicBlock::iterator split_at_inj, split_at_next, itr;
+	for(itr = prevBB->begin(); itr != prevBB->end(); itr++) {
+		if((&*itr) == corrupted) {
+			split_at_inj = itr;
+			break;
+		}
+	}
+	itr++;
+	split_at_next = itr;
+
+	// Using a predicate instead of calling corrupt* function
+	//    at every fault site.
+
+	// BEFORE:
+	// [  BB             (Corrupt)                  ]
+	// AFTER:
+	// [  prevBB  ] [ injBB  (Corrupt) ] [  nextBB  ]
+	assert(itr != prevBB->end());
+	injBB  = prevBB->splitBasicBlock(split_at_inj);
+	nextBB = injBB ->splitBasicBlock(split_at_next);
+	blacklisted_bbs.insert(injBB);
+	blacklisted_bbs.insert(nextBB);
+	TerminatorInst* prevBBT_old = prevBB->getTerminator();
+	prevBBT_old->eraseFromParent();
+	Value* pred = (Value*)(bb_to_pred.at(prevBB));
+	BranchInst::Create(injBB, nextBB, pred, prevBB);
+	bb_to_pred[nextBB] = pred;
+
+	corruptValPhi = PHINode::Create(original->getType(), 0, "Corrupted",
+		&(nextBB->front()));
+//	original->dump();
+//	corrupted->dump();
+//	errs() << "\n";
+	corruptValPhi->addIncoming(original, prevBB);
+	corruptValPhi->addIncoming(corrupted, injBB);
+
+	return corruptValPhi;
+}
+
+// This is the major change on 20130723
+//   I hope this would make the resultant binaries run faster
+// This all happens inside 1 BB, so it should be safe to replace
+//   the uses of "original" only in the current BB
+static void wrapCorruptInstWithBranch(Value* corrupted, 
+	Value* original) {
+	PHINode* corruptValPhi = createBranchForCorruptInst(corrupted, original);
+	// replace uses of "original" with "corrupted"
+	assert(corruptValPhi);
+	BasicBlock* nextBB = corruptValPhi->getParent();
+	BasicBlock::iterator bi = nextBB->begin();
+	bi++; // Skip the PHINode
+	while(bi != nextBB->end()) {
+		Instruction* valu = &(*bi);
+		valu->replaceUsesOfWith(original, corruptValPhi);
+		bi++;
+	}
+	return;
+}
+#endif
+
 std::vector<std::string> splitAtSpace(std::string spltStr){
 	std::vector<std::string> strLst;
 	std::istringstream isstr(spltStr);
@@ -431,7 +547,14 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 
 		if(CallI) {
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			// BI is invalidated after splitting BBs, so we shouldn't use BI
+			I->setOperand(0, corruptValPhi);
+#endif
 			return true;
 		} else {
 			return false;
@@ -549,7 +672,14 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		
 		if(CallI) {
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(opPos,corruptVal);
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(opPos, corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(CallI,
+				I->getOperand(opPos));
+			// BI is invalidated
+			I->setOperand(opPos, corruptValPhi);
+#endif		
 			return true;
 		} else {
 			errs() << "[DataReg_Dyn CmpInst not injected] "
@@ -568,7 +698,7 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		Instruction* INext=NULL;
 		Instruction *IClone = I->clone();
 		assert(IClone);
-		IClone->insertAfter(I); // Why clone ?????????????
+		IClone->insertAfter(I); // Why clone ?
 		Value *instC = &(*IClone);
 		BI = *IClone;
 		args.push_back(instC);
@@ -678,10 +808,9 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 				CallI->setCallingConv(CallingConv::C);
 			}
 		}
-		if(CallI){
+		if(CallI) {
 			Value* corruptVal = &(*CallI);
-			// Tommy: Shall not replace the original instruction itself.
-//				inst->replaceAllUsesWith(corruptVal);
+#ifdef IGNORE_20130723_CHANGES
 			BasicBlock::iterator BI2 = BI;
 			BI2++; // The inserted instruction, don't substitute
 			BI2++; // The one after the inserted instruction, substitute
@@ -690,6 +819,9 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 				valu->replaceUsesOfWith(inst, corruptVal);
 				BI2++;
 			}
+#else
+			wrapCorruptInstWithBranch(corruptVal, inst);
+#endif
 			return true;
 		} else {
 			return false;
@@ -770,28 +902,52 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(1, corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(1));
+			I->setOperand(1, corruptValPhi);
+#endif
 			return true;
 		} else if(stOp->getValueOperand()->getType()->isIntegerTy(64)) {
 			CallI = CallInst::Create(func_corruptIntAdr_64bit,args,"call_corruptIntAdr_64bit",I);       
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(1,corruptVal);
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(1, corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(1));
+			I->setOperand(1, corruptValPhi);
+#endif
 			return true;
 		} else if(stOp->getValueOperand()->getType()->isFloatTy()) {
 			CallI = CallInst::Create(func_corruptFloatAdr_32bit,args,"call_corruptFloatAdr_32bit",I);       
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(1,corruptVal);
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(1, corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(1));
+			I->setOperand(1, corruptValPhi);
+#endif
 			return true;
 		} else if(stOp->getValueOperand()->getType()->isDoubleTy()) {
 			CallI = CallInst::Create(func_corruptFloatAdr_64bit,args,"call_corruptFloatAdr_64bit",I);       
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(1,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(1));
+			I->setOperand(1, corruptValPhi);
+#endif
 			return true;
 		}
 		return false;
@@ -806,28 +962,52 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif
 			return true;
 		} else if(inst->getType()->isIntegerTy(64)) {
 			CallI = CallInst::Create(func_corruptIntAdr_64bit,args,"call_corruptIntAdr_64bit",I);       
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif
 			return true;
 		} else if(inst->getType()->isFloatTy()) {
 			CallI = CallInst::Create(func_corruptFloatAdr_32bit,args,"call_corruptFloatAdr_32bit",I);       
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif
 			return true;
 		} else if(inst->getType()->isDoubleTy()) {
 			CallI = CallInst::Create(func_corruptFloatAdr_64bit,args,"call_corruptFloatAdr_64bit",I);       
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
+#ifdef IGNORE_20130723_CHANGES
 			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif
 			return true;
 		}                     
 	}/*end if*/
@@ -842,28 +1022,52 @@ bool InjectError_PtrError_Dyn(Instruction *I, int fault_index)
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(0, corruptVal);		       
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif	       
 			return true;
 		} else if(inst->getType()->isIntegerTy(64)) {
 			CallI = CallInst::Create(func_corruptIntAdr_64bit,args,"call_corruptIntAdr_64bit",I);           
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(0, corruptVal);		       
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif	       
 			return true;
 		} else if(inst->getType()->isFloatTy()) {
 			CallI = CallInst::Create(func_corruptFloatAdr_32bit,args,"call_corruptFloatAdr_32bit",I);           
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(0, corruptVal);		       
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif	       
 			return true;
 		} else if(inst->getType()->isDoubleTy()) {
 			CallI = CallInst::Create(func_corruptFloatAdr_64bit,args,"call_corruptFloatAdr_64bit",I);           
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			Value* corruptVal = &(*CallI);
-			BI->setOperand(0, corruptVal);		       
+#ifdef IGNORE_20130723_CHANGES
+			BI->setOperand(0,corruptVal);
+#else
+			PHINode* corruptValPhi = createBranchForCorruptInst(corruptVal,
+				I->getOperand(0));
+			I->setOperand(0, corruptValPhi);
+#endif	       
 			return true;
 		}				
 	}/*end if*/   
@@ -907,7 +1111,9 @@ public:
 		for (Module::iterator it = functionList.begin(); it != functionList.end(); ++it,j++) {
 			lstr = it->getName();
 			cstr = lstr.str();                                        
-			if(cstr.find("print_faultStatistics")!=std::string::npos){
+			if (cstr.find("isNextFaultInThisBB") != std::string::npos) {
+				func_isNextFaultInThisBB = &*it; continue;
+			} if(cstr.find("print_faultStatistics")!=std::string::npos){
 				func_print_faultStatistics =&*it; continue;
 			} if(cstr.find("corruptIntData_16bit")!=std::string::npos) {
 				func_corruptIntData_16bit =&*it; continue;
@@ -929,8 +1135,8 @@ public:
 				func_corruptFloatAdr_32bit =&*it; continue;
 			} if(cstr.find("corruptFloatAdr_64bit")!=std::string::npos) {
 				func_corruptFloatAdr_64bit =&*it; continue;
-			} if(cstr.find("incrementInstCount")!=std::string::npos) {
-				func_incrementInstCount =&*it; continue;                            
+			} if(cstr.find("incrementFaultSiteCount")!=std::string::npos) {
+				func_incrementFaultSitesEnumerated =&*it; continue;                            
 			} if(cstr.find("__printInstCount")!=std::string::npos) {
 				func_printInstCount = &*it; continue;
 			} if(cstr.find("initializeFaultInjectionCampaign")!=std::string::npos) {
@@ -965,7 +1171,7 @@ public:
 				}
 				continue;                           
 			}          
-		}/*end for*/        
+		}/*end for*/
 						
 		/* Cache instructions from all the targetable functions for fault injection in case func list is not
 		 * defined by the use. If func list if defined by the use then cache only function defined by the user*/         
@@ -999,9 +1205,11 @@ public:
 				continue;
 
 			/*Cache instruction references with in a function to be considered for fault injection*/             
-			std::set<Instruction*> ilist;
+			std::map<BasicBlock*, std::set<Instruction*> > ilist;
 			for(Function::iterator fi = F->begin(); fi!=F->end(); fi++) {
 				BasicBlock& BB = *fi;
+				BasicBlock* pBB = &BB;
+				ilist[pBB] = std::set<Instruction*>();
 				unsigned vuln = 0;
 				if(is_in_whitelist) {
 					for(BasicBlock::iterator bi = BB.begin(); bi!=BB.end(); bi++) {
@@ -1009,15 +1217,14 @@ public:
 						Instruction* I = &(*bi);
 						Value *in = &(*I);  
 						Instruction* p_in = &*I;
-						if(in == NULL)
-							continue;
-						if(data_err) {                           
+						if(in == NULL) continue;
+						if(data_err) {
 							if(isa<BinaryOperator>(in) || 
-								isa<CmpInst>(in)        ||
-								isa<StoreInst>(in)      ||
+								isa<CmpInst>(in)       ||
+								isa<StoreInst>(in)     ||
 								isa<LoadInst>(in))
 							{
-								ilist.insert(p_in);
+								ilist[pBB].insert(p_in);
 								vuln_delta = 1;
 							}
 						}
@@ -1027,38 +1234,65 @@ public:
 							isa<CallInst>(in)  ||
 							isa<AllocaInst>(in)) 
 							{
-								ilist.insert(p_in);
+								ilist[pBB].insert(p_in);
 								vuln_delta = 1;
 							}
 						}
 						vuln += vuln_delta;
 					}
+
+					// declare an i1 @ beginning of BB
+#ifndef IGNORE_20130723_CHANGES
+					if(vuln > 0)				
+					{
+						Instruction* first = pBB->getFirstNonPHI();
+						std::vector<Value*> args;
+						CallInst* pred = CallInst::Create(func_isNextFaultInThisBB,
+							args, "isNextFaultInThisBB", first);
+						bb_to_pred[pBB] = pred;
+					}
+#endif
 				}
-				bb_inst_counts[&BB] = (is_in_whitelist) ? vuln : 0; // 20130711: I have to remove this b/c this is not consistent with fault_index
 			}
 			/*Check if instruction list is empty*/
 			if(ilist.empty())
 				continue;
 
-			lstsize = ilist.size();
-
-//			while(!ilist.empty()) {
-			for(std::set<Instruction*>::iterator itr = ilist.begin(); itr != ilist.end(); itr++) {
-				fprintf(stderr, "%d faults injected\r", g_fault_index);
-//				Instruction* inst = *(ilist.begin());
-				Instruction* inst = *itr;
-				if(ptr_err) {
-					g_fault_index++;
-					if(InjectError_PtrError_Dyn(inst, g_fault_index))
-						injected_fault_indices.insert(g_fault_index);
+			// Change on 20130723: Using predicate; may save C.P.U. time
+			// Adverse side effect #1: will break a BasicBlock::iterator
+			// luckily, we're not using a BasicBlock::iterator. 
+			std::map<BasicBlock*, std::set<Instruction*> >::iterator itrBBI;
+			for(itrBBI = ilist.begin(); itrBBI != ilist.end(); itrBBI++) {
+				BasicBlock* pBB = itrBBI->first;
+				std::set<Instruction*> theSet = itrBBI->second;
+				unsigned bb_fs_count = 0;
+				for(std::set<Instruction*>::iterator itr = theSet.begin(); itr != theSet.end(); itr++) {
+					fprintf(stderr, "%d faults injected\r", g_fault_index);
+//					Instruction* inst = *(ilist.begin());
+					Instruction* inst = *itr;
+					if(ptr_err) {
+						g_fault_index++;
+						if(InjectError_PtrError_Dyn(inst, g_fault_index)) {
+							injected_fault_indices.insert(g_fault_index);
+							bb_fs_count++;
+						}
+					}
+					if(data_err) {
+						g_fault_index++;
+						if(InjectError_DataReg_Dyn(inst, g_fault_index)) {
+							injected_fault_indices.insert(g_fault_index);
+							bb_fs_count++;
+						}
+					}               
 				}
-				if(data_err) {
-					g_fault_index++;
-					if(InjectError_DataReg_Dyn(inst, g_fault_index))
-						injected_fault_indices.insert(g_fault_index);
-				}               
-			}/*end for*/
-		}/*end for*/
+				bb_fs_counts[pBB] = bb_fs_count;
+			}
+		}
+
+		/* Now I am going to split the BB's
+		 * So the counts should only be -approximate-
+		 * The # of fault sites is added at the beginning of a BB
+		 */
 		appendInstCountCalls(M);
 		
 		// Insert call to initialize fault injection campaign if there's main()
@@ -1078,7 +1312,6 @@ public:
 		}
 
 		// Print out fault site statistics.
-//		printFaultSiteInfo();
 		writeFaultSiteDOTGraph();
 
 		return false;
