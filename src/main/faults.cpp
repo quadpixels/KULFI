@@ -212,7 +212,8 @@ static const char* blacklist[] = {
 	"initializeFaultInjectionCampaign",
 	"shouldInject",
 	"onCountDownReachesZero",
-	"isNextFaultInThisBB"
+	"isNextFaultInThisBB",
+	"incrementFaultSiteCount"
 };
 
 // Add calls to some accounting function for keeping track of # of insts
@@ -621,18 +622,94 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 			CastInst* cast1 = CastInst::CreateTruncOrBitCast(CallI, IntegerType::getInt1Ty(getGlobalContext()), "charToBool", INext);
+			
 			BI->setOperand(opPos, cast1);
 			return true;
 		} else { // OKay, it's a pointer....
 			// Convert to 64-bit integer, corrupt it, then convert back
 			
+#ifndef IGNORE_20130723_CHANGES
+			BINext = BI; BINext++;
+			// Also need split BB here.
+			Type* the_op_type = tcmpOp->getOperand(opPos)->getType();
+			if(the_op_type->isPointerTy()) {
+				PHINode* corruptValPhi = NULL;
+				BasicBlock *injBB, *prevBB, *nextBB;
+				prevBB = cmpOp->getParent();
+
+				// prevBB
+				BasicBlock::iterator split_at_inj, split_at_next, itr;
+				for(itr = prevBB->begin(); itr!=prevBB->end(); itr++)
+					if((&*itr) == cmpOp) break;
+				split_at_inj = itr;
+				assert(split_at_inj  != prevBB->end());
+				injBB = prevBB->splitBasicBlock(split_at_inj);
+
+				Instruction* inj_insert_here = &(injBB->front());
+
+				// injBB
+				Value* i_addr = new PtrToIntInst(
+					tcmpOp->getOperand(opPos),
+					IntegerType::getInt64Ty(getGlobalContext()),
+						tcmpOp->getOperand(opPos)->getName(),
+					//I 
+					inj_insert_here
+				);
+				if(!i_addr) { assert(0 && "Cannot PtrToInt inst. This should not happen!"); }
+				args.pop_back();
+				args.push_back(i_addr);
+				CallI = CallInst::Create(func_corruptIntData_64bit,
+					args,
+					tcmpOp->getOperand(opPos)->getName(),
+					//I
+					inj_insert_here
+				);
+				Value* corrupted_ptr = new IntToPtrInst(
+					CallI,
+					the_op_type,
+					tcmpOp->getOperand(opPos)->getName(),
+					//I
+					inj_insert_here
+				);
+
+				// nextBB
+				split_at_next = injBB->begin();
+				while(true) {
+					if((&*split_at_next) == inj_insert_here) break;
+					split_at_next++;
+				}
+				nextBB = injBB->splitBasicBlock(split_at_next);
+				corruptValPhi = PHINode::Create(the_op_type, 0, "BBBB",
+					&(nextBB->front()));
+				corruptValPhi->addIncoming(tcmpOp->getOperand(opPos), prevBB);
+				corruptValPhi->addIncoming(corrupted_ptr, injBB);
+
+				// prevBB's terminator (do this after {next|inj}BB are ready.)
+				TerminatorInst* prevBBT_old = prevBB->getTerminator();
+				prevBBT_old->eraseFromParent();
+				Value* pred = (Value*)(bb_to_pred.at(prevBB));
+				BranchInst::Create(injBB, nextBB, pred, prevBB);
+				bb_to_pred[nextBB] = pred;
+				blacklisted_bbs.insert(injBB);
+				blacklisted_bbs.insert(nextBB);
+
+				// Blacklist them (do not corrupt them once more in ptr corruption)
+				corrupted_ptrs.insert(CallI);
+				corrupted_ptrs.insert((Instruction*)(tcmpOp->getOperand(opPos)));
+				corrupted_ptrs.insert((Instruction*)(corrupted_ptr));
+				corrupted_ptrs.insert(corruptValPhi);
+
+				cmpOp->setOperand(opPos, corruptValPhi);
+				return true;
+			}
+#else
 			BINext = BI; BINext++;
 			Type* the_op_type = tcmpOp->getOperand(opPos)->getType();
 			if(the_op_type->isPointerTy()) {
 				Value* i_addr = new PtrToIntInst(
 					tcmpOp->getOperand(opPos),
 					IntegerType::getInt64Ty(getGlobalContext()),
-						tcmpOp->getOperand(opPos)->getName(),
+					    tcmpOp->getOperand(opPos)->getName(),
 					I
 				);
 				if(!i_addr) { assert(0 && "Cannot PtrToInt inst. This shall not happen!"); }
@@ -656,6 +733,7 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 				cmpOp->setOperand(opPos, corrupted_ptr);
 				return true;
 			}
+#endif
 		}
 		
 		
@@ -825,6 +903,7 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 			return true;
 		} else {
 			return false;
+			/*
 			if(inst->getType()->isPointerTy() && ptr_err==1) {
 				if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
 
@@ -856,6 +935,7 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 					*(inst->getType()) << "\n";
 				return false;
 			}
+			*/
 		}
 	}/*end if*/
 	return false;
