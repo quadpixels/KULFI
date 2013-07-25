@@ -2,6 +2,9 @@
 // 20130723: Mock implementation of "nextFaultInThisBB" ---->  BB means original BB ! [pointers to original BB's must be preserved]
 //   13:32 It seems to work somehow. Verifying. Proceeding cautiously.
 // and verify counting of fault sites
+// 20130724: CallInsts break computation of BB sizes. In terms of the "accounting" we're doing now,
+//   CallInsts effectively cut a BasicBlock in halves.
+//   So what we should do is to cut the BasicBlocks beforehand!
 /*******************************************************************************************/
 /* Name        : Kontrollable Utah LLVM Fault Injector (KULFI) Tool                        */
 /*											   										       */
@@ -155,10 +158,10 @@ std::list<std::pair<unsigned long, unsigned long> > branch_edge_list;
 
 // Predicate "shall we inject errors in THIS BB?"
 //   Is a Boolean value.
-std::map<const BasicBlock*, const Value*> bb_to_pred;
+std::map<const BasicBlock*, Value*> bb_to_pred;
 // There should not be "incrementFaultSiteCount"s for
 // "alternative BB" and "next BB"'s!
-std::set<const BasicBlock*> blacklisted_bbs;
+std::set<BasicBlock*> blacklisted_bbs;
 void writeFaultSiteDOTGraph();
 
 // Don't use this routine. It's painfully slow!
@@ -191,7 +194,6 @@ static const char* blacklist[] = {
 	"__printInstCount",
 	"printFaultInfo",
 	"initializeFaultInjectionCampaign",
-	"shouldInject",
 	"incrementFaultSiteHit",
 	"incrementInstCount",
 	"__printInstCount",
@@ -209,11 +211,9 @@ static const char* blacklist[] = {
 	"print_faultStatistics",
 	"printFaultInfo",
 	"main",
-	"initializeFaultInjectionCampaign",
-	"shouldInject",
 	"onCountDownReachesZero",
 	"isNextFaultInThisBB",
-	"incrementFaultSiteCount"
+	"incrementFaultSiteCount",
 };
 
 // Add calls to some accounting function for keeping track of # of insts
@@ -248,10 +248,6 @@ static bool isFunctionNameBlacklisted(const char* fn) {
 		if(!strcmp(blacklist1[i], fn)) return true;
 	}
 	return false;
-}
-
-static void addPredicateDecls(Module& M) {
-
 }
 
 // Counts how many fault sites there are in the BasicBlocks in this Module.
@@ -472,6 +468,72 @@ static void wrapCorruptInstWithBranch(Value* corrupted,
 		bi++;
 	}
 	return;
+}
+
+// Fault Site count down is messed by CallInsts.
+// [ Inst ] [ Inst ] [ Inst ] [ Call ] [ Inst ]
+// What I want to do is decrement countdown by 5 @ entry into BB
+// But I can't do this since Call changes control flow and we overcount
+// So the solution is ... split the BB into 2 BB's
+// [ Inst ] [ Inst ] [ Inst ] [ Call ]         [ Inst ]
+static BasicBlock::iterator getFirstCallInst(BasicBlock* bb) {
+	BasicBlock::iterator it;
+	for(it = bb->begin(); it!=bb->end(); it++) {
+		Instruction* inst = &(*it);
+		if(isa<CallInst>(inst)) {
+			return it;
+		}
+	}
+	return bb->end();
+}
+static void splitBBOnCallInsts(Module& M) {
+	Module::FunctionListType &fnList = M.getFunctionList();
+	for(Module::iterator it = fnList.begin(); it != fnList.end(); it++) {
+		Function& F = *it;
+		Function::iterator startFrom = F.begin();
+		while(true) {
+			errs() << "A";
+			bool is_found = false; // found CallInst in function
+			Function::iterator currBB = F.begin();
+			BasicBlock::iterator itr_callI;
+			// while currBB has a CallInst
+
+			// move to "next-BB"
+			while(currBB != startFrom && currBB != F.end()) {
+				currBB++;
+			}
+			if(currBB == F.end()) break;
+			assert(currBB == startFrom);
+
+			do {
+				for(; currBB != F.end(); currBB++) {
+					errs() << "B";
+					BasicBlock* bb = &(*currBB);
+					itr_callI = getFirstCallInst(bb);
+					if(itr_callI != bb->end()) {
+						is_found = true;
+						break;
+					}
+				}
+			} while(false);
+
+			if(is_found) {
+				BasicBlock* callBB = (*currBB).splitBasicBlock(itr_callI, "callBB");
+				blacklisted_bbs.insert(callBB);
+				BasicBlock::iterator next2 = callBB->begin();
+				next2++;
+				BasicBlock* nextStart = callBB->splitBasicBlock(next2, "nextCallBB");
+				bool is_ok = false;
+				for(Function::iterator itr = F.begin(); itr!=F.end(); itr++) {
+					if((&(*itr)) == nextStart) {
+						startFrom = itr;
+						is_ok = true;
+					}
+				}
+				assert(is_ok);
+			} else break;
+		}
+	}
 }
 #endif
 
@@ -749,8 +811,8 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		}
 		
 		if(CallI) {
-			Value* corruptVal = &(*CallI);
 #ifdef IGNORE_20130723_CHANGES
+			Value* corruptVal = &(*CallI);
 			BI->setOperand(opPos, corruptVal);
 #else
 			PHINode* corruptValPhi = createBranchForCorruptInst(CallI,
@@ -888,17 +950,50 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		}
 		if(CallI) {
 			Value* corruptVal = &(*CallI);
-#ifdef IGNORE_20130723_CHANGES
-			BasicBlock::iterator BI2 = BI;
-			BI2++; // The inserted instruction, don't substitute
-			BI2++; // The one after the inserted instruction, substitute
-			while(BI2 != BB->end()) {
-				Instruction* valu = &(*BI2);
-				valu->replaceUsesOfWith(inst, corruptVal);
-				BI2++;
+
+			// The first BI2++:  The inserted instruction, don't substitute 
+			// The second BI2++: The one after the inserted instruction, substitute
+			#define INJECTION_METHOD_ONE \
+			BasicBlock::iterator BI2 = BI; \
+			BI2++; \
+			BI2++; \
+			while(BI2 != BB->end()) { \
+				Instruction* valu = &(*BI2); \
+				valu->replaceUsesOfWith(inst, corruptVal); \
+				BI2++; \
 			}
+
+#ifdef IGNORE_20130723_CHANGES
+			INJECTION_METHOD_ONE;
 #else
-			wrapCorruptInstWithBranch(corruptVal, inst);
+			// Fix on 20130725
+			// After this change, use of inst may be across >1 BB's
+			if(isa<CallInst>(inst)) {
+				Function* F = BB->getParent();
+				Function::iterator FI = F->begin();
+				while(FI != F->end()) {
+					if((&(*FI)) == BB) break;
+					FI++; // FI should point to BI's BB
+				}
+
+				BasicBlock::iterator BI2 = BI;
+				BI2++;
+				BI2++;
+				
+				while(true) {
+					while(BI2 != BB->end()) {
+						Instruction* valu = &(*BI2);
+						valu->replaceUsesOfWith(inst, corruptVal);
+						BI2++;
+					}
+					FI++;
+					if(FI == F->end()) break;
+					BB = &(*FI);
+					BI2 = BB->begin();
+				}
+			} else {
+				wrapCorruptInstWithBranch(corruptVal, inst);
+			}
 #endif
 			return true;
 		} else {
@@ -1168,6 +1263,7 @@ public:
 	virtual bool runOnModule(Module &M) {
 		readFunctionInjWhitelist();
 		recordUseDefChain(M);
+		splitBBOnCallInsts(M);
 
 		errs() << "Haha\n";
 		srand(time(NULL));

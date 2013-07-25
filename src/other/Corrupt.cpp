@@ -66,6 +66,8 @@ int fault_site_adr = 0;
 int enable_fault_site_hist = 0;
 static unsigned curr_hist_size = 1000;
 static unsigned* fault_site_hist;
+
+// This guy should be idempotent
 static void incrementFaultSiteHit(int fsid) {
 	if(enable_fault_site_hist == 0) return;
 	if(fsid >= curr_hist_size) {
@@ -106,29 +108,38 @@ void writeFaultSiteHitHistogram() {
 //
 
 static void onCountDownReachesZero() {
-	if(max_fault_interval > 0)
+	bool is_ijo = ((ijo_flag_data!=0) || (ijo_flag_add!=0));
+	if((!is_ijo) && max_fault_interval > 0) {
 		next_fault_countdown= (int)(rand()*1.0f/RAND_MAX*max_fault_interval);
-	else
+	} else {
 		next_fault_countdown = -1; // Effectively disabling FI
+	}
+	curr_bb_no_fault = true;
 }
 
-
-// Todo: use "countdown" here. Do not use "fault_site_count" here.
 void incrementFaultSiteCount(int bb_fs_count) {
-	if(next_fault_countdown <= bb_fs_count) {
-		if(next_fault_countdown >= 0) {
-			curr_bb_no_fault = false;
-		} else {
-			// This shall only happen when the USER specifies an
-			//   initial countdown which is < 0
-		}
+	// When "logging fault site hit histograms" option is enabled,
+	//   must always set "curr_bb_no_fault" to false
+	if(enable_fault_site_hist) {
+		curr_bb_no_fault = false;
 	} else {
-		// Increment this BB's FS count. Data integrity is guaranteed
-		// because the next fault should not be in this BB
-		fault_site_count += bb_fs_count;
-		next_fault_countdown -= bb_fs_count;
-		curr_bb_no_fault = true;
+		if(next_fault_countdown <= bb_fs_count) {
+			if(next_fault_countdown >= 0) {
+				curr_bb_no_fault = false;
+			} else {
+				// This shall only happen when the USER specifies an
+				//   initial countdown which is < 0
+			}
+		} else {
+			// Increment this BB's FS count. Data integrity is guaranteed
+			// because the next fault should not be in this BB
+			fault_site_count += bb_fs_count;
+			next_fault_countdown -= bb_fs_count;
+			curr_bb_no_fault = true;
+		}
 	}
+//	if(next_fault_countdown>=0)
+//		printf("countdown = %d (bbsize:%d)\n", next_fault_countdown, bb_fs_count);
 }
 
 void initializeFaultInjectionCampaign(int ef, int tf) {
@@ -215,9 +226,9 @@ bool isNextFaultInThisBB() {
 }
 
 static int shouldInject(int ef, int tf) {
-	printf("countdown = %ld\n", next_fault_countdown);
 	if(next_fault_countdown < 0) return 0;
 	next_fault_countdown--;
+//	if(next_fault_countdown>=0) printf("countdown = %d\n", next_fault_countdown);
 	if(next_fault_countdown <= 0) {
 		onCountDownReachesZero();
 		return 1;
@@ -247,7 +258,6 @@ bool corruptIntData_1bit(int fault_index, int inject_once, int ef, int tf, int b
 char corruptIntData_8bit(int fault_index, int inject_once, int ef, int tf, int byte_val, char inst_data) {
 	unsigned int bPos;
 	incrementFaultSiteHit(fault_index);
-	
 	fault_site_count++;
 	fault_site_intData8bit++;
 	if(inject_once == 1)
