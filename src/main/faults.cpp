@@ -471,11 +471,17 @@ static void wrapCorruptInstWithBranch(Value* corrupted,
 }
 
 // Fault Site count down is messed by CallInsts.
+// For a given piece of code that looks like this:
 // [ Inst ] [ Inst ] [ Inst ] [ Call ] [ Inst ]
 // What I want to do is decrement countdown by 5 @ entry into BB
 // But I can't do this since Call changes control flow and we overcount
-// So the solution is ... split the BB into 2 BB's
-// [ Inst ] [ Inst ] [ Inst ] [ Call ]         [ Inst ]
+//
+// So the solution is ... split the BB into 3 BB's
+// The BBs before & after the CallInst decrement the countdown by
+//   their respective #s of fault sites.
+//
+// [ Inst ] [ Inst ] [ Inst ]          [ Call ]         [ Inst ]
+//
 static BasicBlock::iterator getFirstCallInst(BasicBlock* bb) {
 	BasicBlock::iterator it;
 	for(it = bb->begin(); it!=bb->end(); it++) {
@@ -492,7 +498,6 @@ static void splitBBOnCallInsts(Module& M) {
 		Function& F = *it;
 		Function::iterator startFrom = F.begin();
 		while(true) {
-			errs() << "A";
 			bool is_found = false; // found CallInst in function
 			Function::iterator currBB = F.begin();
 			BasicBlock::iterator itr_callI;
@@ -507,7 +512,6 @@ static void splitBBOnCallInsts(Module& M) {
 
 			do {
 				for(; currBB != F.end(); currBB++) {
-					errs() << "B";
 					BasicBlock* bb = &(*currBB);
 					itr_callI = getFirstCallInst(bb);
 					if(itr_callI != bb->end()) {
@@ -1262,10 +1266,12 @@ public:
 	dynfault() : ModulePass(ID) {}
 	virtual bool runOnModule(Module &M) {
 		readFunctionInjWhitelist();
+		errs() << "Fault injection white list read\n";
 		recordUseDefChain(M);
+		errs() << "Def-use chain recorded\n";
 		splitBBOnCallInsts(M);
-
-		errs() << "Haha\n";
+		errs() << "BBs split on CallInsts\n";
+		
 		srand(time(NULL));
 		if(byte_val < 0 || byte_val > 7) 
 		byte_val = rand()%8;				 
