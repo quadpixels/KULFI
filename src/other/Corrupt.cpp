@@ -70,6 +70,8 @@ int enable_fault_site_hist = 0;
 static unsigned curr_hist_size = 1000;
 static unsigned* fault_site_hist;
 
+static bool is_dump_bb_trace = false;
+
 // This guy should be idempotent
 static void incrementFaultSiteHit(int fsid) {
 	if(enable_fault_site_hist == 0) return;
@@ -111,7 +113,6 @@ void writeFaultSiteHitHistogram() {
 // "Instruction" here means LLVM instructions
 //    not real machine instructions
 //
-
 static void onCountDownReachesZero() {
 	bool is_ijo = ((ijo_flag_data!=0) || (ijo_flag_add!=0));
 	if((!is_ijo) && max_fault_interval > 0) {
@@ -122,9 +123,13 @@ static void onCountDownReachesZero() {
 	curr_bb_no_fault = true;
 }
 
-void incrementFaultSiteCount(int bb_fs_count) {
+void incrementFaultSiteCount(char* bbname, int bb_fs_count) {
 	// When "logging fault site hit histograms" option is enabled,
 	//   must always set "curr_bb_no_fault" to false
+	if(is_dump_bb_trace) {
+		fprintf(stderr, "[KULFI] Entered BB \"%s\"\n", bbname);
+	}
+	
 	if(enable_fault_site_hist) {
 		curr_bb_no_fault = false;
 	} else {
@@ -180,6 +185,9 @@ void initializeFaultInjectionCampaign(int ef, int tf) {
 				if(sscanf(line, "-bit_position=%d",
 					&bit_position) == 1) {
 					printf("   Bit position for faults=%d\n", bit_position);
+				}
+				if(sscanf(line, "-dump_bb_trace=%d", &is_dump_bb_trace)==1) {
+					printf("   Dump BB Trace=%d\n", is_dump_bb_trace);
 				}
 			}
 			fclose(f);

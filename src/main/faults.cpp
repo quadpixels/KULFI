@@ -9,7 +9,7 @@
 /* Name        : Kontrollable Utah LLVM Fault Injector (KULFI) Tool                        */
 /*											   										       */
 /* Owner       : This tool is owned by Gauss Research Group at School of Computing,        */
-/*               University of Utah, Salt Lake City, USA.     d                             */
+/*               University of Utah, Salt Lake City, USA.                                  */
 /*               Please send your queries to: gauss@cs.utah.edu                            */
 /*               Researh Group Home Page: http://www.cs.utah.edu/formal_verification/      */
 /* Version     : beta 									   								   */
@@ -56,6 +56,7 @@
 
 using namespace llvm;
 const char* getMyTypeName(const Value* v);
+static IRBuilder<true, ConstantFolder, IRBuilderDefaultInserter<true> >* g_irbuilder;
 
 static cl::opt<std::string> func_list("fn", cl::desc("Name(s) of the function(s) to be targeted"), cl::value_desc("func1 func2 func3"), cl::init(""), cl::ValueRequired);
 static cl::opt<int> ef("ef", cl::desc("expected number of fault occurence"), cl::value_desc("Any value greater than or equal to 0 and less than or equal to tf"), cl::init(100), cl::ValueRequired);
@@ -129,6 +130,7 @@ static std::map<int, std::pair<std::string, FaultType> > g_fault_sites;
 
 std::set<Instruction*> corrupted_ptrs;
 std::map<BasicBlock*, unsigned> bb_fs_counts; // Fault Site count of each BB
+std::map<BasicBlock*, std::string> bb_names; // BB names.
 
 static std::string instToString(const Instruction* inst) {
 	std::string str;
@@ -148,7 +150,6 @@ std::set<unsigned long> is_in_chain; // Is a node in the use-def chain?
 std::set<unsigned long> is_terminator; // Is this a terminator instruction?
 std::set<int> injected_fault_indices; // Is the fault site at this index really injected?
 std::map<const BasicBlock*, std::list<unsigned long> > nodeids_in_basicblocks;
-std::map<const BasicBlock*, std::string> bb_names;
 std::map<const Function*, std::list<const BasicBlock*> > bbs_in_funcs;
 std::map<const Value*, unsigned long> fault_site_to_nodeid;
 std::map<unsigned long, int> nodeid_to_fault_site_id;
@@ -214,6 +215,8 @@ static const char* blacklist[] = {
 	"onCountDownReachesZero",
 	"isNextFaultInThisBB",
 	"incrementFaultSiteCount",
+	"onEnteringBB",
+	"_ZNK3MPI8Cartcomm5CloneEv",
 };
 
 // Add calls to some accounting function for keeping track of # of insts
@@ -283,10 +286,29 @@ static void appendInstCountCalls(Module& M) {
 			if(size < 1) continue;
 //			errs() << "bb = " << size << "\n";
 			std::vector<Value*> args;
+			assert(bb_names.find(bb) != bb_names.end());
+			std::string bbn = bb_names[bb];
+//			args.push_back(g_irbuilder->CreateGlobalStringPtr(bbn, "bbname"));
+			// Create a global variable.
+			
+			IRBuilder<> irb(bb);
+			
+			Value* global_str_ptr = irb.CreateGlobalString(bbn, "bbname");
+			
+			std::vector<Value*> indices;
+			indices.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), 0));
+			indices.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), 0));
+			
+			GetElementPtrInst* gep_str = GetElementPtrInst::CreateInBounds(global_str_ptr,
+				indices,
+				"bbname", bb->getFirstNonPHI());
+			
+			args.push_back(gep_str);
 			args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),
 				size));
 			CallInst* inc_call = CallInst::Create(func_incrementFaultSitesEnumerated, args,
 				"", first_inst);
+			
 			assert(inc_call);
 			// Do not inject into this call
 			corrupted_ptrs.insert(inc_call);
@@ -540,6 +562,36 @@ static void splitBBOnCallInsts(Module& M) {
 	}
 }
 #endif
+void addBBEntryCalls(Module& M) {
+	char tmp[100];
+	std::set<std::string> used_names;
+	Module::FunctionListType &fnList = M.getFunctionList();
+	for(Module::iterator it = fnList.begin(); it != fnList.end(); it++) {
+		Function& F = *it;
+		Function::iterator it2 = F.begin();
+		unsigned fnbbcnt = 0; // fnbbcnt reads "function BB count".
+		for(; it2 != F.end(); it2++) {
+			BasicBlock* pBB = &(*it2);
+			std::string bbname, bbname1;
+			if(pBB->getName().size() > 0) {
+				bbname = pBB->getName();
+			} else {
+				sprintf(tmp, "%s_%u", F.getName().data(), fnbbcnt);
+				bbname = tmp;
+			}
+			unsigned retry_cnt = 0;
+			bbname1 = bbname;
+			while(used_names.find(bbname) != used_names.end()) {
+				retry_cnt++;
+				sprintf(tmp, "%s_%u", bbname1.c_str(), retry_cnt);
+				bbname = tmp;
+			}
+			used_names.insert(bbname);
+			bb_names[pBB] = bbname;
+			fnbbcnt++;
+		}
+	}
+}
 
 std::vector<std::string> splitAtSpace(std::string spltStr){
 	std::vector<std::string> strLst;
@@ -1265,12 +1317,15 @@ public:
 	static char ID; 
 	dynfault() : ModulePass(ID) {}
 	virtual bool runOnModule(Module &M) {
+		g_irbuilder = new IRBuilder<true, ConstantFolder, IRBuilderDefaultInserter<true> >(
+			getGlobalContext());
 		readFunctionInjWhitelist();
 		errs() << "Fault injection white list read\n";
 		recordUseDefChain(M);
 		errs() << "Def-use chain recorded\n";
 		splitBBOnCallInsts(M);
 		errs() << "BBs split on CallInsts\n";
+		addBBEntryCalls(M);
 		
 		srand(time(NULL));
 		if(byte_val < 0 || byte_val > 7) 
@@ -1861,7 +1916,7 @@ void recordUseDefChain(Module& M) {
 			}
 			nodeids_in_basicblocks[pBB] = nodeids;
 			std::string bb_name = pBB->getName().str();
-			bb_names[pBB] = bb_name;
+//			bb_names[pBB] = bb_name;
 		}
 		bbs_in_funcs[pF] = bbs;
 	}
@@ -1951,7 +2006,7 @@ void writeFaultSiteDOTGraph() {
 		fprintf(out, "\tsubgraph cluster%d { label=\"%s\"\n", cluster_idx, s.c_str());
 		cluster_idx++;
 		for(std::list<const BasicBlock*>::const_iterator itr = blist.begin(); itr != blist.end(); itr++) {
-			const BasicBlock* pBB = *itr;
+			BasicBlock* pBB = (BasicBlock*)(*itr);
 			if(nodeids_in_basicblocks.find(pBB) == nodeids_in_basicblocks.end()) continue;
 			std::list<unsigned long>& nodes = nodeids_in_basicblocks[pBB];
 			std::string bb_name = bb_names[pBB];
