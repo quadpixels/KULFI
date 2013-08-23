@@ -46,6 +46,7 @@
 #include "llvm/CallingConv.h"
 #include "llvm/Analysis/Verifier.h"
 #include "llvm/Assembly/PrintModulePass.h"
+#include "/home/nitroglycerine/Downloads/llvm-3.2.src/lib/VMCore/ConstantsContext.h"
 
 // Log the information of fault sites
 //   in case they become useful afterwards
@@ -80,6 +81,19 @@ static bool shouldInjectFunction(const Function* f) {
 		}
 	}
 	return false;
+}
+
+static Instruction* getFirstNonPHINonLandingPad(BasicBlock* pBB) {
+	Instruction* ret = pBB->getFirstNonPHI();
+	BasicBlock::iterator itr;// = pBB->begin();
+	for(itr = pBB->begin(); itr != pBB->end(); itr++) {
+		if(isa<LandingPadInst>(*itr)) {
+			itr++;
+			ret = &*itr;
+			return ret;
+		}
+	}
+	return ret;
 }
 
 static void readFunctionInjWhitelist() {
@@ -276,7 +290,8 @@ static void appendInstCountCalls(Module& M) {
 			BasicBlock* bb = &(*bi);
 			if(blacklisted_bbs.find(bb) != blacklisted_bbs.end()) continue;
 
-			Instruction* first_inst = bb->getFirstNonPHI();
+			Instruction* first_inst = getFirstNonPHINonLandingPad(bb);
+			
 			unsigned size = 0;
 			if(!(bb_fs_counts.find(bb) != bb_fs_counts.end())) {
 				bb->getParent()->dump();
@@ -301,7 +316,7 @@ static void appendInstCountCalls(Module& M) {
 			
 			GetElementPtrInst* gep_str = GetElementPtrInst::CreateInBounds(global_str_ptr,
 				indices,
-				"bbname", bb->getFirstNonPHI());
+				"bbname", first_inst);
 			
 			args.push_back(gep_str);
 			args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),
@@ -1482,7 +1497,7 @@ public:
 #ifndef IGNORE_20130723_CHANGES
 					if(vuln > 0)				
 					{
-						Instruction* first = pBB->getFirstNonPHI();
+						Instruction* first = getFirstNonPHINonLandingPad(pBB);
 						std::vector<Value*> args;
 						CallInst* pred = CallInst::Create(func_isNextFaultInThisBB,
 							args, "isNextFaultInThisBB", first);
