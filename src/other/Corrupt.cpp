@@ -21,7 +21,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <assert.h>
 #include <map>
+#include <string>
+#include <string.h>
+
+// Changes on Aug 27: Log event: entering some basic block
+#define IS_BB_LOG_USE_SQLITE
+#ifdef IS_BB_LOG_USE_SQLITE
+	#include "sqlite3.h"
+	sqlite3* g_bbhist_db;
+#else
+	#include <zlib.h>
+	gzFile* g_bbhist_file;
+#endif
+
+const unsigned int BBHIST_FLUSH_INTERVAL = 100000;
+class BBHistEntry {
+public:
+	char* bbname; // name of BB
+	unsigned long dyn_fs_id; // Dynamic Fault Site ID (aka. fault_site_count)
+	BBHistEntry() {
+		strcpy(bbname, "blah");
+		dyn_fs_id = (unsigned long)-1;
+	}
+};
+
+static BBHistEntry* g_bbhist = NULL;
+static volatile int g_bbhist_idx = 0;
 
 #ifdef __cplusplus
 extern "C" {
@@ -123,11 +150,48 @@ static void onCountDownReachesZero() {
 	curr_bb_no_fault = true;
 }
 
+void flushBBEntries() {
+	#ifdef IS_BB_LOG_USE_SQLITE
+		sqlite3_exec(g_bbhist_db, "BEGIN", NULL, NULL, NULL);
+		for(unsigned i=0; i<g_bbhist_idx; i++) {
+			BBHistEntry* ety = &(g_bbhist[i]);
+			std::string insert_query = "INSERT INTO bbhistory "
+			"(BBName, LastDynFSID) VALUES (?, ?);";
+			int err;
+			sqlite3_stmt* insert_stmt;
+			err = sqlite3_prepare_v2(g_bbhist_db, insert_query.c_str(),
+				-1, &insert_stmt, NULL);
+			assert(err == SQLITE_OK);
+			err = sqlite3_bind_text(insert_stmt, 1,
+				ety->bbname, strlen(ety->bbname), SQLITE_TRANSIENT);
+			assert(err == SQLITE_OK);
+			err = sqlite3_bind_int64(insert_stmt, 2, ety->dyn_fs_id);
+			assert(err == SQLITE_OK);
+			err = sqlite3_step(insert_stmt);
+			assert(err == SQLITE_DONE);
+			sqlite3_finalize(insert_stmt);
+		}
+		printf("Wrote %u entries to DB\n", BBHIST_FLUSH_INTERVAL);
+		sqlite3_exec(g_bbhist_db, "COMMIT", NULL, NULL, NULL);
+	#else
+		
+	#endif
+}
+
 void incrementFaultSiteCount(char* bbname, int bb_fs_count) {
 	// When "logging fault site hit histograms" option is enabled,
 	//   must always set "curr_bb_no_fault" to false
 	if(is_dump_bb_trace) {
-		fprintf(stderr, "[KULFI] Entered BB \"%s\"\n", bbname);
+		// should mutex lock
+		BBHistEntry* ety = &(g_bbhist[g_bbhist_idx]);
+		g_bbhist_idx++;
+		ety->bbname = bbname;
+		ety->dyn_fs_id = fault_site_count;
+		if(g_bbhist_idx == BBHIST_FLUSH_INTERVAL) {
+			flushBBEntries();
+			g_bbhist_idx = 0;
+		}
+		// should mutex release
 	}
 	
 	if(enable_fault_site_hist) {
@@ -186,12 +250,56 @@ void initializeFaultInjectionCampaign(int ef, int tf) {
 					&bit_position) == 1) {
 					printf("   Bit position for faults=%d\n", bit_position);
 				}
-				if(sscanf(line, "-dump_bb_trace=%d", &is_dump_bb_trace)==1) {
+				int tmp;
+				if(sscanf(line, "-dump_bb_trace=%d", &tmp)==1) {
+					is_dump_bb_trace = (bool)tmp;
 					printf("   Dump BB Trace=%d\n", is_dump_bb_trace);
 				}
 			}
 			fclose(f);
 		}
+	}
+	
+	if(is_dump_bb_trace)
+	{
+		// Initialize BB history database
+		#ifdef IS_BB_LOG_USE_SQLITE
+			int err;
+			err = sqlite3_open("basic_block_history.db", &g_bbhist_db);
+			if(err != SQLITE_OK) {
+				printf("Error: cannot open SQLite database.\n");
+				exit(1);
+			}
+			
+			std::string drop_query = "DROP TABLE IF EXISTS bbhistory;";
+			sqlite3_stmt* drop_stmt;
+			sqlite3_prepare_v2(g_bbhist_db, drop_query.c_str(), (int)(drop_query.size()),
+				&drop_stmt, NULL);
+			err = sqlite3_step(drop_stmt);
+			if(err != SQLITE_DONE) {
+				printf("Error: error initializing DB (1)\n");
+			}
+			sqlite3_finalize(drop_stmt);
+			
+			std::string create_query = "CREATE TABLE IF NOT EXISTS bbhistory "
+			"(BBName TEXT, LastDynFSID INTEGER);";
+			sqlite3_stmt* create_stmt;
+			sqlite3_prepare_v2(g_bbhist_db, create_query.c_str(), (int)(create_query.size()),
+				&create_stmt, NULL);
+			err = sqlite3_step(create_stmt);
+			if(err != SQLITE_DONE) {
+				printf("Error: error initializing DB (2)\n");
+			}
+			sqlite3_finalize(create_stmt);
+			
+			g_bbhist = (BBHistEntry*)malloc(sizeof(BBHistEntry)*
+				BBHIST_FLUSH_INTERVAL);
+			for(unsigned i=0; i<BBHIST_FLUSH_INTERVAL; i++) {
+				new (&(g_bbhist[i])) BBHistEntry();
+			}
+		#else
+			assert(0);
+		#endif
 	}
 	
 	if(rand_flag) {
@@ -235,6 +343,11 @@ int print_faultStatistics(){
 	fprintf(stderr, "\nTotal # Ptr fault sites enumerated : %d",fault_site_adr);
 	fprintf(stderr, "\n/*********************************End**************************************/\n");
 	if(enable_fault_site_hist) writeFaultSiteHitHistogram();
+	if(is_dump_bb_trace) {
+		#ifdef IS_BB_LOG_USE_SQLITE
+			sqlite3_close(g_bbhist_db);
+		#endif
+	}
 	return 0;
 }
 

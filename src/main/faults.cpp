@@ -5,6 +5,10 @@
 // 20130724: CallInsts break computation of BB sizes. In terms of the "accounting" we're doing now,
 //   CallInsts effectively cut a BasicBlock in halves.
 //   So what we should do is to cut the BasicBlocks beforehand!
+
+// 20130827: Should make the injector [[[[ thread safe ]]]]
+
+
 /*******************************************************************************************/
 /* Name        : Kontrollable Utah LLVM Fault Injector (KULFI) Tool                        */
 /*											   										       */
@@ -48,8 +52,6 @@
 #include "llvm/Assembly/PrintModulePass.h"
 #include "/home/nitroglycerine/Downloads/llvm-3.2.src/lib/VMCore/ConstantsContext.h"
 
-// Log the information of fault sites
-//   in case they become useful afterwards
 
 // Enable this macro to use old code
 // Otherwise, use the code on 2013-07-23
@@ -231,60 +233,23 @@ static const char* blacklist[] = {
 	"incrementFaultSiteCount",
 	"onEnteringBB",
 	"_ZNK3MPI8Cartcomm5CloneEv",
-};
-
-// Add calls to some accounting function for keeping track of # of insts
-// executed
-static const char* blacklist1[] = {
-	"incrementInstCount",
-	"__printInstCount",
-	"corruptIntData_16bit",
-	"corruptIntData_32bit",
-	"corruptIntData_64bit",
-	"corruptIntData_8bit",
-	"corruptIntData_1bit",
-	"corruptFloatData_32bit",
-	"corruptFloatData_64bit",
-	"corruptIntAdr_32bit",
-	"corruptIntAdr_64bit",
-	"corruptFloatAdr_32bit",
-	"corruptFloatAdr_64bit",
-	"print_faultStatistics",
-	"printFaultInfo",
-	"main",
-	"initializeFaultInjectionCampaign",
-	"shouldInject",
-	"onCountDownReachesZero"
+	"flushBBEntries",
 };
 
 static bool isFunctionNameBlacklisted(const char* fn) {
 	for(unsigned i=0; i<sizeof(blacklist) / sizeof(const char*); i++) {
 		if(!strcmp(blacklist[i], fn)) return true;
 	}
-	for(unsigned i=0; i<sizeof(blacklist1)/ sizeof(const char*); i++) {
-		if(!strcmp(blacklist1[i], fn)) return true;
-	}
 	return false;
 }
 
 // Counts how many fault sites there are in the BasicBlocks in this Module.
 static void appendInstCountCalls(Module& M) {
-	// Call incrementInstCount using the constants as arguments.
 	Module::FunctionListType &fl = M.getFunctionList();
 	for(Module::iterator it = fl.begin(); it!=fl.end(); it++) {
 		Function& F = *it;
 		std::string cstr = it->getName().str();
-//		bool is_blacklisted = false;
-//		for(unsigned i=0; i<sizeof(blacklist1)/sizeof(char*); i++) {
-//			errs() << cstr << ",\n";
-//			if(cstr == blacklist1[i]) { 
-//				errs() << "Blacklisted.\n";
-//				is_blacklisted = true; break; 
-//			}
-//		}
-
 		bool is_blacklisted = isFunctionNameBlacklisted(cstr.c_str());
-
 		if(is_blacklisted) continue;
 		for(Function::iterator bi = F.begin(); bi!=F.end(); bi++) {
 			BasicBlock* bb = &(*bi);
@@ -299,17 +264,13 @@ static void appendInstCountCalls(Module& M) {
 			}
 			size = bb_fs_counts[bb];
 			if(size < 1) continue;
-//			errs() << "bb = " << size << "\n";
 			std::vector<Value*> args;
 			assert(bb_names.find(bb) != bb_names.end());
 			std::string bbn = bb_names[bb];
-//			args.push_back(g_irbuilder->CreateGlobalStringPtr(bbn, "bbname"));
+			
 			// Create a global variable.
-			
 			IRBuilder<> irb(bb);
-			
 			Value* global_str_ptr = irb.CreateGlobalString(bbn, "bbname");
-			
 			std::vector<Value*> indices;
 			indices.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), 0));
 			indices.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()), 0));
@@ -378,7 +339,7 @@ static void printFaultSiteInfo() {
 // One caveat is that "replace all uses" of inst should be replaced with
 //    "replace all uses but the first" when updating uses of inst.
 Value* CorruptPointer(Value* inst,
-	BasicBlock::iterator BINext, // 2 cases: may be the end of BB or otherwise.
+	BasicBlock::iterator BINext, // 2 cases: may be the end of BB or in a BB.
 	BasicBlock* BB,
 	std::vector<Value*>& _args) {
 	Instruction* INext = &*BINext;
@@ -390,7 +351,7 @@ Value* CorruptPointer(Value* inst,
 	assert(inst->getType()->isPointerTy());
 	Value* iPtr = NULL; // Pointer converted to Integer.
 	if(INext!=NULL) {
-		iPtr = new PtrToIntInst(inst, // Difference between "inst" and the "inst" in an "args" above????
+		iPtr = new PtrToIntInst(inst,
 			IntegerType::getInt64Ty(getGlobalContext()),
 			name_ptr2int,
 			INext
@@ -405,7 +366,8 @@ Value* CorruptPointer(Value* inst,
 		corrupted_ptrs.insert((Instruction*)(iPtr));
 	}
 	if(!iPtr) assert(0);
-	std::vector<Value*> args = _args;
+	std::vector<Value*> args;// = _args;
+	args.clear();
 	// Increment g_fault_index
 	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),g_fault_index));
 	std::vector<Value*>::iterator itr;
@@ -417,6 +379,30 @@ Value* CorruptPointer(Value* inst,
 	}
 	args.push_back(iPtr); // <--- The input param is not modified!
 
+	
+	#define CHECK_ARGS(fn) \
+	{ \
+		Function* f = (Function*)(fn); \
+		errs() << "::::" << f->getArgumentList().size() << "," << args.size() ; \
+		errs() << "\n"; \
+		inst->getType()->dump(); \
+		errs() << "\n"; \
+		Function::ArgumentListType::iterator itr = f->getArgumentList().begin(); \
+		std::vector<Value*>::iterator itr2 = args.begin(); \
+		for(; itr!=f->getArgumentList().end(); itr++, itr2++) { \
+			Value* v = *itr2; \
+			Argument* a = &(*itr); \
+			Type* t_v = v->getType(); \
+			Type* t_a = a->getType(); \
+			errs() << " :: "; \
+			t_v->dump();  \
+			errs() << " ";  \
+			t_a->dump();  \
+			errs() << " \n"; \
+		} \
+	}
+//	CHECK_ARGS(func_corruptIntAdr_64bit);	
+	
 	Value* corruptedPtr = NULL;
 	if(INext != NULL) { 
 		CallI = CallInst::Create(func_corruptIntData_64bit, args, corr_name_ptr2int, INext);
@@ -578,7 +564,9 @@ static void splitBBOnCallInsts(Module& M) {
 }
 #endif
 void addBBEntryCalls(Module& M) {
-	char tmp[100];
+	const unsigned LEN = 1024;
+	char tmp[LEN]; // Function name may be very long, resulting in stack smashing
+	unsigned len = 0;
 	std::set<std::string> used_names;
 	Module::FunctionListType &fnList = M.getFunctionList();
 	for(Module::iterator it = fnList.begin(); it != fnList.end(); it++) {
@@ -591,6 +579,8 @@ void addBBEntryCalls(Module& M) {
 			if(pBB->getName().size() > 0) {
 				bbname = pBB->getName();
 			} else {
+				len = strlen(F.getName().data());
+				assert(len <= LEN); 
 				sprintf(tmp, "%s_%u", F.getName().data(), fnbbcnt);
 				bbname = tmp;
 			}
@@ -598,6 +588,8 @@ void addBBEntryCalls(Module& M) {
 			bbname1 = bbname;
 			while(used_names.find(bbname) != used_names.end()) {
 				retry_cnt++;
+				len = strlen(bbname1.c_str());
+				assert(len <= LEN);
 				sprintf(tmp, "%s_%u", bbname1.c_str(), retry_cnt);
 				bbname = tmp;
 			}
@@ -636,6 +628,7 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 	/*Build argument list before calling Corrupt function*/
 	CallInst* CallI=NULL;
 	std::vector<Value*> args;
+	args.clear();
 	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),fault_index));
 	args.push_back(ConstantInt::get(IntegerType::getInt32Ty(getGlobalContext()),ijo));
 	if(print_fs)
@@ -691,16 +684,16 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 #endif
 			return true;
 		} else {
-			return false;
 			Value* inst = tstOp->getOperand(0);
 			if(inst->getType()->isPointerTy()) {
 				if(ptr_err == 1) {
 					// When data_err and ptr_err are enabled simultaneously,
-					//    and if the operand 0 is ofo pointer type, it should
+					//    and if the operand 0 is of pointer type, it should
 					//    have already been corrupted.
 					inst->dump();
 					errs() << corrupted_ptrs.size() << " etys\n";
 					if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
+					errs() << "args has " << args.size() << "etys\n";
 					args.pop_back();
 					Value* corruptedPtr = CorruptPointer(inst, I, BB, args);
 					errs() << "old store: "; tstOp->dump();
@@ -709,13 +702,11 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 					errs() << "corrupted: "; corruptedPtr->dump();
 					errs() << "new store: "; tstOp->dump();
 				}
-				/*
-				errs() << "[DataReg_Dyn Store Inst not captured] ";
-				errs() << *(tstOp);
-				errs() << "\n";
-				*/
-				return false;
 			}
+			errs() << "[DataReg_Dyn Store Inst not captured] ";
+			errs() << *(tstOp);
+			errs() << "\n";
+			return false;
 		}
 		tstOp->dump();
 		assert(0);
@@ -924,26 +915,6 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		args.push_back(instC);
 		
 		
-		#define CHECK_ARGS(fn) \
-		{ \
-			Function* f = (Function*)(fn); \
-			errs() << "::::" << f->getArgumentList().size() << "," << args.size() ; \
-			inst->getType()->dump(); \
-			errs() << "\n"; \
-			Function::ArgumentListType::iterator itr = f->getArgumentList().begin(); \
-			std::vector<Value*>::iterator itr2 = args.begin(); \
-			for(; itr!=f->getArgumentList().end(); itr++, itr2++) { \
-				Value* v = *itr2; \
-				Argument* a = &(*itr); \
-				Type* t_v = v->getType(); \
-				Type* t_a = a->getType(); \
-				errs() << " :: "; \
-				t_v->dump();  \
-				errs() << " ";  \
-				t_a->dump();  \
-				errs() << " \n"; \
-			} \
-		}
 		
 		/*Corrupt Variable*/      
 		if(BI == BB->end()){
@@ -1669,11 +1640,8 @@ bool InjectError_PtrError(Instruction *I)
 			);
 		if(!iAddr) assert(0 ** "Create PtrToInt inst error. This should not happen!");
 
-//	Value *tVal=ConstantInt::get(stInst->getPointerOperand()->getType(),mask);
 		Value *tVal = ConstantInt::get(IntegerType::getInt64Ty(getGlobalContext()), mask);
-			
-//    BinaryOperator *N = BinaryOperator::Create(Instruction::And,
-//        tVal, stInst->getPointerOperand(), top->getName(), BI); 
+ 
 		BinaryOperator *N = BinaryOperator::Create(Instruction::And,
 			tVal, iAddr, top->getName(), BI);
 
