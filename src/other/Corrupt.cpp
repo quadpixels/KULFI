@@ -36,6 +36,14 @@
 	gzFile* g_bbhist_file;
 #endif
 
+
+#ifdef __cplusplus
+extern "C" {
+#else
+	#error "Please compile Corrupt.cpp with a C++ compiler."
+	This is a syntax error placed here to stop the compiler
+#endif
+
 const unsigned int BBHIST_FLUSH_INTERVAL = 100000;
 class BBHistEntry {
 public:
@@ -49,13 +57,6 @@ public:
 
 static BBHistEntry* g_bbhist = NULL;
 static volatile int g_bbhist_idx = 0;
-
-#ifdef __cplusplus
-extern "C" {
-#else
-	#error "Please compile Corrupt.cpp with a C++ compiler."
-	This is a syntax error placed here to stop the compiler
-#endif
 
 // Interval can at most be how many instructions?
 static unsigned curr_bb_fs_count = 0;
