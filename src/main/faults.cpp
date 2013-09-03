@@ -7,7 +7,7 @@
 //   So what we should do is to cut the BasicBlocks beforehand!
 
 // 20130827: Should make the injector [[[[ thread safe ]]]]
-
+// 20130903: BBHistEntry::BBHistEntry, the constructor, shall not be injected
 
 /*******************************************************************************************/
 /* Name        : Kontrollable Utah LLVM Fault Injector (KULFI) Tool                        */
@@ -234,6 +234,11 @@ static const char* blacklist[] = {
 	"onEnteringBB",
 	"_ZNK3MPI8Cartcomm5CloneEv",
 	"flushBBEntries",
+	"_ZN11BBHistEntryC1Ev", // BBHistEntry::BBHistEntry()
+	"_ZN11BBHistEntryC2Ev",
+	"_ZN11BBHistEntryC3Ev", // Can anyone tell me why {1,2,3}?
+	"writeFaultSiteHitHistogram",
+	"_GLOBAL__I_a", // .text.startup
 };
 
 static bool isFunctionNameBlacklisted(const char* fn) {
@@ -690,17 +695,17 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 					// When data_err and ptr_err are enabled simultaneously,
 					//    and if the operand 0 is of pointer type, it should
 					//    have already been corrupted.
-					inst->dump();
-					errs() << corrupted_ptrs.size() << " etys\n";
+//					inst->dump();
+//					errs() << corrupted_ptrs.size() << " etys\n";
 					if(corrupted_ptrs.find(I) != corrupted_ptrs.end()) return false;
-					errs() << "args has " << args.size() << "etys\n";
+//					errs() << "args has " << args.size() << "etys\n";
 					args.pop_back();
 					Value* corruptedPtr = CorruptPointer(inst, I, BB, args);
-					errs() << "old store: "; tstOp->dump();
+//					errs() << "old store: "; tstOp->dump();
 					tstOp->replaceUsesOfWith(inst, corruptedPtr);
-					errs() << "inst: "; inst->dump();
-					errs() << "corrupted: "; corruptedPtr->dump();
-					errs() << "new store: "; tstOp->dump();
+//					errs() << "inst: "; inst->dump();
+//					errs() << "corrupted: "; corruptedPtr->dump();
+//					errs() << "new store: "; tstOp->dump();
 				}
 			}
 			errs() << "[DataReg_Dyn Store Inst not captured] ";
