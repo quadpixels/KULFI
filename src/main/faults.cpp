@@ -1,3 +1,8 @@
+// 20140204: 
+// [DataReg_Dyn CmpInst not injected] i1
+//   %87 = fcmp une x86_fp80 %86, 0xK00000000000000000000
+//
+//
 // 20130717: Add counting to end of BB; shall add another to the beginning of BB,
 // 20130723: Mock implementation of "nextFaultInThisBB" ---->  BB means original BB ! [pointers to original BB's must be preserved]
 //   13:32 It seems to work somehow. Verifying. Proceeding cautiously.
@@ -50,8 +55,6 @@
 #include "llvm/CallingConv.h"
 #include "llvm/Analysis/Verifier.h"
 #include "llvm/Assembly/PrintModulePass.h"
-#include "/home/nitroglycerine/Downloads/llvm-3.2.src/lib/VMCore/ConstantsContext.h"
-
 
 // Enable this macro to use old code
 // Otherwise, use the code on 2013-07-23
@@ -123,6 +126,7 @@ Value* func_corruptIntData_32bit;
 Value* func_corruptIntData_64bit;
 Value* func_corruptFloatData_32bit;
 Value* func_corruptFloatData_64bit;
+Value* func_corruptFloatData_80bit; // X86 FP80
 Value* func_corruptIntAdr_32bit;
 Value* func_corruptIntAdr_64bit;
 Value* func_corruptFloatAdr_32bit;
@@ -221,6 +225,7 @@ static const char* blacklist[] = {
 	"corruptIntData_1bit",
 	"corruptFloatData_32bit",
 	"corruptFloatData_64bit",
+	"corruptFloatData_80bit",
 	"corruptIntAdr_32bit",
 	"corruptIntAdr_64bit",
 	"corruptFloatAdr_32bit",
@@ -239,6 +244,9 @@ static const char* blacklist[] = {
 	"_ZN11BBHistEntryC3Ev", // Can anyone tell me why {1,2,3}?
 	"writeFaultSiteHitHistogram",
 	"_GLOBAL__I_a", // .text.startup
+	"MY_SET_SIGSEGV_HANDLER",
+	"EnableKulfi",
+	"DisableKulfi"
 };
 
 static bool isFunctionNameBlacklisted(const char* fn) {
@@ -469,9 +477,6 @@ static PHINode* createBranchForCorruptInst(Value* corrupted,
 
 	corruptValPhi = PHINode::Create(original->getType(), 0, "Corrupted",
 		&(nextBB->front()));
-//	original->dump();
-//	corrupted->dump();
-//	errs() << "\n";
 	corruptValPhi->addIncoming(original, prevBB);
 	corruptValPhi->addIncoming(corrupted, injBB);
 
@@ -708,9 +713,9 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 //					errs() << "new store: "; tstOp->dump();
 				}
 			}
-			errs() << "[DataReg_Dyn Store Inst not captured] ";
-			errs() << *(tstOp);
-			errs() << "\n";
+//			errs() << "[DataReg_Dyn Store Inst not captured] ";
+//			errs() << *(tstOp);
+//			errs() << "\n";
 			return false;
 		}
 		tstOp->dump();
@@ -866,13 +871,18 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 		}
 		
 		
-		/*Float Data*/
+		/* Float Data */
 		if(tcmpOp->getOperand(opPos)->getType()->isFloatTy()){
 			CallI = CallInst::Create(func_corruptFloatData_32bit,args,"call_corruptFloatData_32bit",I);
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 		} else if(tcmpOp->getOperand(opPos)->getType()->isDoubleTy()){
 			CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
+			assert(CallI);
+			CallI->setCallingConv(CallingConv::C);
+		} else if(tcmpOp->getOperand(opPos)->getType()->isX86_FP80Ty()) {
+			errs() << "[DataReg_Dyn] FP80\n";
+			CallI = CallInst::Create(func_corruptFloatData_80bit,args,"call_corruptfloatData_80bit",I);
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
 		}
@@ -1308,8 +1318,7 @@ public:
 	static char ID; 
 	dynfault() : ModulePass(ID) {}
 	virtual bool runOnModule(Module &M) {
-		g_irbuilder = new IRBuilder<true, ConstantFolder, IRBuilderDefaultInserter<true> >(
-			getGlobalContext());
+		g_irbuilder = new IRBuilder<true, ConstantFolder, IRBuilderDefaultInserter<true> >(getGlobalContext());
 		readFunctionInjWhitelist();
 		errs() << "Fault injection white list read\n";
 		recordUseDefChain(M);
@@ -1355,6 +1364,8 @@ public:
 				func_corruptFloatData_32bit =&*it; continue;
 			} if(cstr.find("corruptFloatData_64bit")!=std::string::npos) {
 				func_corruptFloatData_64bit =&*it; continue;
+			} if(cstr.find("corruptFloatData_80bit")!=std::string::npos) {
+				func_corruptFloatData_80bit =&*it; continue;
 			} if(cstr.find("corruptIntAdr_32bit")!=std::string::npos) {
 				func_corruptIntAdr_32bit =&*it; continue;
 			} if(cstr.find("corruptIntAdr_64bit")!=std::string::npos) {
@@ -1643,7 +1654,7 @@ bool InjectError_PtrError(Instruction *I)
 			top->getName(),
 			stInst
 			);
-		if(!iAddr) assert(0 ** "Create PtrToInt inst error. This should not happen!");
+		if(!iAddr) assert(0 && "Create PtrToInt inst error. This should not happen!");
 
 		Value *tVal = ConstantInt::get(IntegerType::getInt64Ty(getGlobalContext()), mask);
  
@@ -2050,13 +2061,6 @@ void writeFaultSiteDOTGraph() {
 		unsigned long from = itr->first, to = itr->second;
 		fprintf(out, "\tNode%lu -> Node%lu\n", from, to);
 	}
-/*
-	for(std::list<std::pair<unsigned long, unsigned long> >::iterator itr =
-		branch_edge_list.begin(); itr != branch_edge_list.end(); itr++) {
-		unsigned long from = itr->first, to = itr->second;
-		fprintf(out, "\tNode%lu -> Node%lu [color=\"blue\"]\n", from, to);
-	}
-*/
 	fprintf(out, "}\n");
 	fclose(out);
 }
