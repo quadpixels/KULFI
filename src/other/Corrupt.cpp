@@ -26,6 +26,7 @@
 #include <map>
 #include <string>
 #include <string.h>
+#include <unordered_map>
 
 // Changes on Aug 27: Log event: entering some basic block
 #define IS_BB_LOG_USE_SQLITE
@@ -108,8 +109,9 @@ extern "C" {
 	int enable_fault_site_hist = 0;
 	static unsigned curr_hist_size = 1000;
 	static unsigned* fault_site_hist;
+	std::unordered_map<std::string, unsigned long>* g_bbhistogram;
 	
-	static bool is_dump_bb_trace = false;
+	static bool is_dump_bb_trace = false, is_count_bb_histogram = false;
 	
 	// This guy should be idempotent
 	static void incrementFaultSiteHit(int fsid) {
@@ -204,6 +206,17 @@ extern "C" {
 			}
 			// should mutex release
 		}
+
+		// !! C++ STL HERE
+		DisableKulfi();
+		if(is_count_bb_histogram) {
+			std::string key = bbname;
+			if(g_bbhistogram->find(key) == g_bbhistogram->end()) {
+				(*g_bbhistogram)[key] = bb_fs_count;
+			} else {
+				(*g_bbhistogram)[key] += bb_fs_count;
+			}
+		}
 		
 		if(enable_fault_site_hist) {
 			curr_bb_no_fault = false;
@@ -225,6 +238,7 @@ extern "C" {
 				curr_bb_no_fault = true;
 			}
 		}
+		EnableKulfi();
 	}
 	
 	void initializeFaultInjectionCampaign(int ef, int tf) {
@@ -283,6 +297,13 @@ extern "C" {
 					int x = 0;
 					assert(sscanf(bbtrace, "%d", &x)==1);
 					is_dump_bb_trace = (bool) x;
+				}
+
+				char* bbhistogram = getenv("COUNT_BB_HISTOGRAM");
+				if(bbhistogram) {
+					int x = 0;
+					assert(sscanf(bbhistogram, "%d", &x) == 1);
+					is_count_bb_histogram = (bool)x;
 				}
 				
 				char* enabled = getenv("KULFI_ENABLED");
@@ -348,6 +369,12 @@ extern "C" {
 				assert(0);
 			#endif
 		}
+
+		if(is_count_bb_histogram) {
+			DisableKulfi(); // If we don't do DisableKulfi here, the CTOR of unordered_map would be screwed up
+			g_bbhistogram = new std::unordered_map<std::string, unsigned long>();
+			EnableKulfi();
+		}
 		
 		if(rand_flag) {
 			printf("   Initialized randomization seed.\n");
@@ -380,7 +407,7 @@ extern "C" {
 	int print_faultStatistics(){
 		fprintf(stderr, "\n/*********************Fault Injection Statistics****************************/");
 		fprintf(stderr, "\nTotal # fault sites enumerated : %lu",fault_site_count);
-		fprintf(stderr, "\nFurther sub-categorization of fault sites below:");
+		fprintf(stderr, "\nCategorization of fault sites individually enumerated:");
 		fprintf(stderr, "\nTotal # 8-bit  Int Data fault sites enumerated : %d",fault_site_intData8bit);
 		fprintf(stderr, "\nTotal # 16-bit Int Data fault sites enumerated : %d",fault_site_intData16bit);
 		fprintf(stderr, "\nTotal # 32-bit Int Data fault sites enumerated : %d",fault_site_intData32bit);
@@ -394,6 +421,17 @@ extern "C" {
 			#ifdef IS_BB_LOG_USE_SQLITE
 				sqlite3_close(g_bbhist_db);
 			#endif
+		}
+		DisableKulfi();
+		if(is_count_bb_histogram) {
+			FILE* f = fopen("kulfi_bbhistogram.txt", "w");
+			for(std::unordered_map<std::string, unsigned long>::iterator itr = g_bbhistogram->begin();
+				itr != g_bbhistogram->end(); itr++) {
+				std::string x = itr->first;
+				unsigned long fs_count = itr->second;
+				fprintf(f, "%s\t%lu\n", x.c_str(), fs_count);
+				printf("%s\t%lu\n", x.c_str(), fs_count);
+			}
 		}
 		return 0;
 	}
@@ -416,11 +454,14 @@ extern "C" {
 	// Changed in order for PHINode to work
 	// (If there is no PHINode, it's legal to use an i32 where an i1 is required)
 	// but with PHINode, this has become illegal
+
+	// Don't add to fault_site_count b/c they are already pre-added when entering a B.B.
+
 	bool corruptIntData_1bit(int fault_index, int inject_once, int ef, int tf, int byte_val, char inst_data) {
 		if(!is_kulfi_enabled) return (bool)inst_data;
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_intData1bit++;
 		if(inject_once == 1)
 			ijo_flag_data = 1;
@@ -442,7 +483,7 @@ extern "C" {
 		if(!is_kulfi_enabled) return inst_data;
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_intData8bit++;
 		if(inject_once == 1)
 			ijo_flag_data=1;
@@ -466,7 +507,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_intData16bit++;
 		if(inject_once == 1)
 			ijo_flag_data=1;
@@ -492,7 +533,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_intData32bit++;
 		if(inject_once == 1)
 			ijo_flag_data=1;
@@ -519,7 +560,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_float32bit++;
 		if(inject_once == 1)
 			ijo_flag_data=1;
@@ -546,7 +587,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_intData64bit++;
 		if(inject_once == 1)
 			 ijo_flag_data=1;
@@ -573,7 +614,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_float64bit++;
 		if(inject_once == 1)
 			ijo_flag_data=1;
@@ -601,7 +642,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_float80bit++;
 		if(inject_once == 1)
 			ijo_flag_data=1;
@@ -636,7 +677,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_adr++;
 		if(inject_once == 1)
 			ijo_flag_add=1;
@@ -664,7 +705,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);                
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_adr++;
 		if(inject_once == 1)
 			ijo_flag_add=1;
@@ -692,7 +733,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_adr++;
 		if(inject_once == 1)
 			ijo_flag_add=1;
@@ -720,7 +761,7 @@ extern "C" {
 		unsigned int bPos;
 		incrementFaultSiteHit(fault_index);
 		int rp;
-		fault_site_count++;
+//		fault_site_count++;
 		fault_site_adr++;
 		if(inject_once == 1)
 			ijo_flag_add=1;

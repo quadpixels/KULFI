@@ -1,3 +1,6 @@
+// 20140303:
+// Fix BB count of Splitted Call Instructions
+
 // 20140204: 
 // [DataReg_Dyn CmpInst not injected] i1
 //   %87 = fcmp une x86_fp80 %86, 0xK00000000000000000000
@@ -149,6 +152,7 @@ enum FaultType {
 static std::map<int, std::pair<std::string, FaultType> > g_fault_sites;
 
 std::set<Instruction*> corrupted_ptrs;
+std::set<BasicBlock*> call_next_bbs; // The BB that follows a Call BB. 
 std::map<BasicBlock*, unsigned> bb_fs_counts; // Fault Site count of each BB
 std::map<BasicBlock*, std::string> bb_names; // BB names.
 
@@ -277,6 +281,7 @@ static void appendInstCountCalls(Module& M) {
 			}
 			size = bb_fs_counts[bb];
 			if(size < 1) continue;
+			if(call_next_bbs.find(bb) != call_next_bbs.end()) { size = size + 1; }
 			std::vector<Value*> args;
 			assert(bb_names.find(bb) != bb_names.end());
 			std::string bbn = bb_names[bb];
@@ -555,11 +560,13 @@ static void splitBBOnCallInsts(Module& M) {
 			} while(false);
 
 			if(is_found) {
-				BasicBlock* callBB = (*currBB).splitBasicBlock(itr_callI, "callBB");
+				std::string x = F.getName();
+				BasicBlock* callBB = (*currBB).splitBasicBlock(itr_callI, x + "_callBB");
 				blacklisted_bbs.insert(callBB);
 				BasicBlock::iterator next2 = callBB->begin();
 				next2++;
-				BasicBlock* nextStart = callBB->splitBasicBlock(next2, "nextCallBB");
+				BasicBlock* nextStart = callBB->splitBasicBlock(next2, x + "_nextCallBB");
+				call_next_bbs.insert(nextStart);
 				bool is_ok = false;
 				for(Function::iterator itr = F.begin(); itr!=F.end(); itr++) {
 					if((&(*itr)) == nextStart) {
@@ -880,13 +887,14 @@ bool InjectError_DataReg_Dyn(Instruction *I, int fault_index)
 			CallI = CallInst::Create(func_corruptFloatData_64bit,args,"call_corruptFloatData_64bit",I);
 			assert(CallI);
 			CallI->setCallingConv(CallingConv::C);
-		} else if(tcmpOp->getOperand(opPos)->getType()->isX86_FP80Ty()) {
-			errs() << "[DataReg_Dyn] FP80\n";
-			CallI = CallInst::Create(func_corruptFloatData_80bit,args,"call_corruptfloatData_80bit",I);
-			assert(CallI);
-			CallI->setCallingConv(CallingConv::C);
+		} else {
+			if(tcmpOp->getOperand(opPos)->getType()->isX86_FP80Ty()) {
+				errs() << "[DataReg_Dyn] FP80\n";
+				CallI = CallInst::Create(func_corruptFloatData_80bit,args,"call_corruptfloatData_80bit",I);
+				assert(CallI);
+				CallI->setCallingConv(CallingConv::C);
+			}
 		}
-		
 		if(CallI) {
 #ifdef IGNORE_20130723_CHANGES
 			Value* corruptVal = &(*CallI);
